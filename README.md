@@ -69,3 +69,4 @@ Webapp (`webapp/.env.example`):
 
 - `docs/ui/telegram-miniapp-design.md`
 - `docs/ui/thumb-reach.md`
+- `deploy/nginx/happiiiiibot.ammarfaisal.me.conf`
