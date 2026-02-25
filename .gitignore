@@ -1,0 +1,30 @@
+# General
+.DS_Store
+.cache/
+*.log
+
+# Env (commit *.example only)
+.env
+.env.*
+!.env.example
+
+# Rust
+/backend/target/
+**/target/
+
+# Node / Next.js
+/webapp/node_modules/
+**/node_modules/
+/webapp/.next/
+**/.next/
+*.tsbuildinfo
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+
