@@ -2,8 +2,10 @@ mod api;
 mod auth;
 mod config;
 mod db;
+mod dotenv;
 mod http_error;
 mod state;
+mod telegram;
 mod user_id;
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
@@ -11,8 +13,16 @@ use state::AppState;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    dotenv::load_dotenv_if_present();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -30,8 +40,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = AppState { db };
 
+    telegram::spawn_set_webhook_on_startup();
+
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/telegram/webhook", axum::routing::post(telegram::telegram_webhook))
         .nest("/v1", api::v1::router())
         .with_state(app_state)
         .layer(TraceLayer::new_for_http())

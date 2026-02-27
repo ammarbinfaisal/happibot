@@ -33,7 +33,7 @@ Or standalone:
 
 ```sh
 docker build -t happi-backend ./backend
-docker run --rm -p 8080:8080 -e TELEGRAM_BOT_TOKEN=... happi-backend
+docker run --rm -p 8580:8080 -e TELEGRAM_BOT_TOKEN=... happi-backend
 ```
 
 ### Local auth
@@ -59,6 +59,9 @@ Backend (`backend/.env.example`):
 - `DATABASE_URL` default `sqlite://./happi.db?mode=rwc`
 - `TELEGRAM_BOT_TOKEN` required to validate `x-telegram-init-data`
 - `CORS_ALLOW_ORIGIN` optional; if unset CORS is permissive for dev
+- `HOOK_URL` optional; if set backend will call Telegram `setWebhook` on startup
+- `WEBHOOK_SECRET_TOKEN` optional; if set required for `POST /telegram/webhook`
+- `MINIAPP_URL` optional; used for the bot’s `/start` Web App button
 
 Webapp (`webapp/.env.example`):
 

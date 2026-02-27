@@ -28,3 +28,4 @@ sudo certbot certonly --webroot -w /var/www/certbot -d happiiiiibot.ammarfaisal.
 
 After cert issuance, add an HTTPS `server { listen 443 ssl; ... }` block (or use `certbot --nginx`).
 
+Note: this Nginx config proxies to the backend on `127.0.0.1:8580` (Docker-published port).

@@ -2,6 +2,8 @@ services:
   backend:
     build:
       context: ./backend
+    env_file:
+      - .env
     environment:
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: sqlite:///data/happi.db?mode=rwc
@@ -9,10 +11,9 @@ services:
       # TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       RUST_LOG: info
     ports:
-      - "8080:8080"
+      - "8580:8080"
     volumes:
       - happi-data:/data
 
 volumes:
   happi-data: {}
-
