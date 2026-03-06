@@ -22,6 +22,14 @@ export type Goal = {
   status: string;
 };
 
+export type MoodPoint = {
+  date: string;
+  happiness: number;
+  energy: number;
+  stress: number;
+  note: string | null;
+};
+
 export type WeeklyReviewStats = {
   user_id: number;
   week: string;
