@@ -38,6 +38,57 @@ export type WeeklyReviewStats = {
   active_goals: number;
 };
 
+export type ProgressEntry = {
+  date: string;
+  value: number | null;
+  note: string | null;
+  confidence: number | null;
+};
+
+export type GoalWithProgress = {
+  id: string;
+  title: string;
+  why: string | null;
+  metric: string | null;
+  target_kind: string;
+  target_value: number | null;
+  target_text: string | null;
+  deadline: string | null;
+  cadence: string | null;
+  tags: string[];
+  status: string;
+  progress_last_7d: ProgressEntry[];
+  total_logs: number;
+  latest_value: number | null;
+  completion_pct: number | null;
+};
+
+export type IkigaiProfile = {
+  mission: string | null;
+  themes: string[];
+};
+
+export type GoalAlignmentEntry = {
+  goal_id: string;
+  goal_title: string;
+  alignment_score: number;
+  quadrants: string[];
+};
+
+export type StreakInfo = {
+  current_mood_streak: number;
+  current_progress_streak: number;
+};
+
+export type DashboardData = {
+  goals: GoalWithProgress[];
+  mood_trend: MoodPoint[];
+  weekly_stats: WeeklyReviewStats;
+  ikigai: IkigaiProfile | null;
+  goal_alignments: GoalAlignmentEntry[];
+  streak: StreakInfo;
+};
+
 function apiBaseUrl() {
   return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
 }

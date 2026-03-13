@@ -41,26 +41,29 @@ pub fn auth_user_id(headers: &HeaderMap, bot_token: Option<&str>) -> Result<i64,
 
 fn verify_init_data_and_get_user_id(init_data: &str, bot_token: &str) -> Result<i64, HttpError> {
     // init_data is querystring like "query_id=...&user=...&auth_date=...&hash=..."
-    let mut pairs: Vec<(&str, &str)> = init_data
+    // Values are percent-encoded; Telegram computes the hash on decoded values,
+    // so we must decode before building data_check_string.
+    let raw_pairs: Vec<(&str, &str)> = init_data
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .collect();
 
     let mut provided_hash: Option<&str> = None;
-    pairs.retain(|(k, v)| {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (k, v) in &raw_pairs {
         if *k == "hash" {
             provided_hash = Some(*v);
-            false
         } else {
-            !v.is_empty()
+            let decoded_v = percent_decode(v)?;
+            pairs.push((k.to_string(), decoded_v));
         }
-    });
+    }
 
     let provided_hash =
         provided_hash.ok_or_else(|| HttpError::unauthorized("initData missing hash"))?;
 
     // data_check_string: sort by key and join "key=value" with "\n"
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let data_check_string = pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -88,19 +91,15 @@ fn verify_init_data_and_get_user_id(init_data: &str, bot_token: &str) -> Result<
         return Err(HttpError::unauthorized("invalid initData hash"));
     }
 
-    // Extract user.id from the "user" field. The value is urlencoded JSON.
-    // We do minimal parsing to avoid needing to fully decode querystring rules:
-    // - percent-decode the user field
-    // - parse JSON
-    let user_encoded = pairs
+    // Extract user.id from the "user" field (already decoded above).
+    let user_json = pairs
         .iter()
-        .find(|(k, _)| *k == "user")
-        .map(|(_, v)| *v)
+        .find(|(k, _)| k == "user")
+        .map(|(_, v)| v.as_str())
         .ok_or_else(|| HttpError::unauthorized("initData missing user field"))?;
 
-    let user_json = percent_decode(user_encoded)?;
     let user_val: serde_json::Value =
-        serde_json::from_str(&user_json).map_err(|_| HttpError::bad_request("bad user json"))?;
+        serde_json::from_str(user_json).map_err(|_| HttpError::bad_request("bad user json"))?;
 
     let user_id = user_val
         .get("id")

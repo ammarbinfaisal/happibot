@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -17,11 +17,16 @@ pub fn router() -> Router<AppState> {
         .route("/profile", get(get_user_profile))
         .route("/goals", get(list_goals).post(create_goal))
         .route("/goals/{goal_id}", post(update_goal))
+        .route("/goals/{goal_id}/alignment", post(save_goal_alignment))
         .route("/progress", post(log_progress))
+        .route("/progress/history", get(progress_history))
         .route("/mood", post(log_mood))
+        .route("/mood/history", get(mood_history))
         .route("/reminders", post(schedule_reminder))
         .route("/checkins/due", get(get_due_checkins))
         .route("/reviews/weekly", get(summarize_week))
+        .route("/dashboard", get(get_dashboard))
+        .route("/ikigai", get(get_ikigai).post(save_ikigai))
 }
 
 fn user_id_from(headers: &HeaderMap) -> Result<i64, HttpError> {
@@ -493,6 +498,48 @@ async fn log_mood(
 }
 
 #[derive(Deserialize)]
+struct MoodHistoryQuery {
+    days: Option<i64>, // default 30
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct MoodPoint {
+    date: String,
+    happiness: i64,
+    energy: i64,
+    stress: i64,
+    note: Option<String>,
+}
+
+async fn mood_history(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MoodHistoryQuery>,
+) -> Result<Json<Vec<MoodPoint>>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    let days = q.days.unwrap_or(30).min(365);
+    let date_from = (Utc::now().date_naive() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let rows: Vec<MoodPoint> = sqlx::query_as(
+        r#"
+        SELECT date, happiness, energy, stress, note
+        FROM mood_logs
+        WHERE user_id = ? AND date >= ?
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(&date_from)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
 struct ScheduleReminderBody {
     r#type: String,
     schedule_kind: Option<String>,
@@ -524,12 +571,15 @@ async fn schedule_reminder(
         .unwrap_or_else(|| "rrule".to_string());
     let enabled = body.enabled.unwrap_or(true);
 
+    let next_run_at = crate::scheduler::compute_next_run(&schedule_kind, &body.schedule, Utc::now())
+        .map(|dt| dt.to_rfc3339());
+
     sqlx::query(
         r#"
         INSERT INTO reminders (
           id, user_id, type, schedule_kind, schedule,
-          payload_json, quiet_hours_json, start_date, enabled
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          payload_json, quiet_hours_json, start_date, next_run_at, enabled
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&id)
@@ -540,6 +590,7 @@ async fn schedule_reminder(
     .bind(payload_json)
     .bind(quiet_hours_json)
     .bind(body.start_date.as_deref())
+    .bind(next_run_at.as_deref())
     .bind(if enabled { 1 } else { 0 })
     .execute(&st.db)
     .await
@@ -679,4 +730,479 @@ async fn summarize_week(
         progress_logs,
         active_goals,
     }))
+}
+
+// ── Dashboard ──
+
+#[derive(Serialize)]
+struct DashboardResponse {
+    goals: Vec<GoalWithProgress>,
+    mood_trend: Vec<MoodPoint>,
+    weekly_stats: WeeklyReviewStats,
+    ikigai: Option<IkigaiProfile>,
+    goal_alignments: Vec<GoalAlignmentEntry>,
+    streak: StreakInfo,
+}
+
+#[derive(Serialize)]
+struct GoalWithProgress {
+    #[serde(flatten)]
+    goal: Goal,
+    progress_last_7d: Vec<ProgressEntry>,
+    total_logs: i64,
+    latest_value: Option<f64>,
+    completion_pct: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct ProgressEntry {
+    date: String,
+    value: Option<f64>,
+    note: Option<String>,
+    confidence: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ProgressEntryRow {
+    date: String,
+    value: Option<f64>,
+    note: Option<String>,
+    confidence: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct IkigaiProfile {
+    mission: Option<String>,
+    themes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GoalAlignmentEntry {
+    goal_id: String,
+    goal_title: String,
+    alignment_score: i64,
+    quadrants: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct StreakInfo {
+    current_mood_streak: i64,
+    current_progress_streak: i64,
+}
+
+async fn get_dashboard(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DashboardResponse>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    let now = Utc::now().date_naive();
+    let seven_days_ago = (now - Duration::days(6)).format("%Y-%m-%d").to_string();
+    let thirty_days_ago = (now - Duration::days(30)).format("%Y-%m-%d").to_string();
+    let today = now.format("%Y-%m-%d").to_string();
+
+    // Load active goals
+    let goal_rows: Vec<GoalRow> = sqlx::query_as(
+        r#"
+        SELECT id, title, why, metric, target_kind, target_value, target_text,
+               deadline, cadence, tags_json, status
+        FROM goals
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let mut goals_with_progress = Vec::with_capacity(goal_rows.len());
+    for r in &goal_rows {
+        let tags: Vec<String> = serde_json::from_str(&r.tags_json).unwrap_or_default();
+
+        // Progress for last 7 days
+        let progress_rows: Vec<ProgressEntryRow> = sqlx::query_as(
+            r#"
+            SELECT date, value, note, confidence
+            FROM progress_logs
+            WHERE user_id = ? AND goal_id = ? AND date >= ?
+            ORDER BY date ASC
+            "#,
+        )
+        .bind(user_id)
+        .bind(&r.id)
+        .bind(&seven_days_ago)
+        .fetch_all(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+        let total_logs: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM progress_logs WHERE user_id = ? AND goal_id = ?",
+        )
+        .bind(user_id)
+        .bind(&r.id)
+        .fetch_one(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+        let latest_value: Option<f64> = sqlx::query_scalar(
+            "SELECT value FROM progress_logs WHERE user_id = ? AND goal_id = ? ORDER BY date DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(&r.id)
+        .fetch_optional(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?
+        .flatten();
+
+        let completion_pct = match (latest_value, r.target_value) {
+            (Some(v), Some(t)) if t > 0.0 => Some((v / t * 100.0).min(100.0)),
+            _ => None,
+        };
+
+        let progress_entries: Vec<ProgressEntry> = progress_rows
+            .into_iter()
+            .map(|p| ProgressEntry {
+                date: p.date,
+                value: p.value,
+                note: p.note,
+                confidence: p.confidence,
+            })
+            .collect();
+
+        goals_with_progress.push(GoalWithProgress {
+            goal: Goal {
+                id: r.id.clone(),
+                title: r.title.clone(),
+                why: r.why.clone(),
+                metric: r.metric.clone(),
+                target_kind: r.target_kind.clone(),
+                target_value: r.target_value,
+                target_text: r.target_text.clone(),
+                deadline: r.deadline.clone(),
+                cadence: r.cadence.clone(),
+                tags,
+                status: r.status.clone(),
+            },
+            progress_last_7d: progress_entries,
+            total_logs,
+            latest_value,
+            completion_pct,
+        });
+    }
+
+    // Mood trend (last 30 days)
+    let mood_trend: Vec<MoodPoint> = sqlx::query_as(
+        r#"
+        SELECT date, happiness, energy, stress, note
+        FROM mood_logs
+        WHERE user_id = ? AND date >= ?
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(&thirty_days_ago)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    // Weekly stats
+    let iso = now.iso_week();
+    let week_str = format!("{}-{:02}", iso.year(), iso.week());
+
+    let mood_days: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM mood_logs WHERE user_id = ? AND date BETWEEN ? AND ?",
+    )
+    .bind(user_id)
+    .bind(&seven_days_ago)
+    .bind(&today)
+    .fetch_one(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let progress_log_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM progress_logs WHERE user_id = ? AND date BETWEEN ? AND ?",
+    )
+    .bind(user_id)
+    .bind(&seven_days_ago)
+    .bind(&today)
+    .fetch_one(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let active_goals_count = goal_rows.len() as i64;
+
+    // Ikigai profile
+    let ikigai = {
+        let row: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+        row.map(|(mission, themes_json)| {
+            let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
+            IkigaiProfile { mission, themes }
+        })
+    };
+
+    // Goal alignments
+    let alignment_rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        r#"
+        SELECT ga.goal_id, ga.alignment_score, ga.quadrants_json, g.title
+        FROM goal_alignment ga
+        JOIN goals g ON g.id = ga.goal_id
+        WHERE ga.user_id = ? AND g.status = 'active'
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let goal_alignments: Vec<GoalAlignmentEntry> = alignment_rows
+        .into_iter()
+        .map(|(goal_id, score, quadrants_json, title)| {
+            let quadrants: Vec<String> = serde_json::from_str(&quadrants_json).unwrap_or_default();
+            GoalAlignmentEntry {
+                goal_id,
+                goal_title: title,
+                alignment_score: score,
+                quadrants,
+            }
+        })
+        .collect();
+
+    // Streaks
+    let mood_streak = compute_streak(
+        &st.db,
+        user_id,
+        "SELECT DISTINCT date FROM mood_logs WHERE user_id = ? ORDER BY date DESC",
+        now,
+    )
+    .await;
+
+    let progress_streak = compute_streak(
+        &st.db,
+        user_id,
+        "SELECT DISTINCT date FROM progress_logs WHERE user_id = ? ORDER BY date DESC",
+        now,
+    )
+    .await;
+
+    Ok(Json(DashboardResponse {
+        goals: goals_with_progress,
+        mood_trend,
+        weekly_stats: WeeklyReviewStats {
+            user_id,
+            week: week_str,
+            mood_days,
+            progress_logs: progress_log_count,
+            active_goals: active_goals_count,
+        },
+        ikigai,
+        goal_alignments,
+        streak: StreakInfo {
+            current_mood_streak: mood_streak,
+            current_progress_streak: progress_streak,
+        },
+    }))
+}
+
+async fn compute_streak(
+    db: &SqlitePool,
+    user_id: i64,
+    query: &str,
+    today: NaiveDate,
+) -> i64 {
+    let dates: Vec<(String,)> = match sqlx::query_as(query)
+        .bind(user_id)
+        .fetch_all(db)
+        .await
+    {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    let mut streak = 0i64;
+    let mut expected = today;
+
+    for (date_str,) in &dates {
+        if let Ok(d) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            if d == expected {
+                streak += 1;
+                expected -= Duration::days(1);
+            } else if d < expected {
+                break;
+            }
+        }
+    }
+
+    streak
+}
+
+// ── Progress history ──
+
+#[derive(Deserialize)]
+struct ProgressHistoryQuery {
+    goal_id: String,
+    days: Option<i64>,
+}
+
+async fn progress_history(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ProgressHistoryQuery>,
+) -> Result<Json<Vec<ProgressEntry>>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    let days = q.days.unwrap_or(30).min(365);
+    let date_from = (Utc::now().date_naive() - Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let rows: Vec<ProgressEntryRow> = sqlx::query_as(
+        r#"
+        SELECT date, value, note, confidence
+        FROM progress_logs
+        WHERE user_id = ? AND goal_id = ? AND date >= ?
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(&q.goal_id)
+    .bind(&date_from)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let entries: Vec<ProgressEntry> = rows
+        .into_iter()
+        .map(|r| ProgressEntry {
+            date: r.date,
+            value: r.value,
+            note: r.note,
+            confidence: r.confidence,
+        })
+        .collect();
+
+    Ok(Json(entries))
+}
+
+// ── Ikigai ──
+
+async fn get_ikigai(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Option<IkigaiProfile>>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let profile = row.map(|(mission, themes_json)| {
+        let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
+        IkigaiProfile { mission, themes }
+    });
+
+    Ok(Json(profile))
+}
+
+#[derive(Deserialize)]
+struct SaveIkigaiBody {
+    mission: Option<String>,
+    themes: Option<Vec<String>>,
+}
+
+async fn save_ikigai(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SaveIkigaiBody>,
+) -> Result<impl IntoResponse, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    let themes_json =
+        serde_json::to_string(&body.themes.unwrap_or_default()).unwrap_or_else(|_| "[]".into());
+
+    sqlx::query(
+        r#"
+        INSERT INTO ikigai_profiles (user_id, mission, themes_json)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          mission = excluded.mission,
+          themes_json = excluded.themes_json,
+          updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        "#,
+    )
+    .bind(user_id)
+    .bind(body.mission.as_deref())
+    .bind(&themes_json)
+    .execute(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ── Goal alignment ──
+
+#[derive(Deserialize)]
+struct SaveAlignmentBody {
+    alignment_score: i64,
+    quadrants: Vec<String>,
+}
+
+async fn save_goal_alignment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(goal_id): axum::extract::Path<String>,
+    Json(body): Json<SaveAlignmentBody>,
+) -> Result<impl IntoResponse, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    if !(1..=100).contains(&body.alignment_score) {
+        return Err(HttpError::bad_request("alignment_score must be 1..100"));
+    }
+
+    let valid_quadrants = ["passion", "mission", "profession", "vocation"];
+    for q in &body.quadrants {
+        if !valid_quadrants.contains(&q.as_str()) {
+            return Err(HttpError::bad_request(format!(
+                "invalid quadrant: {q}. Must be one of: passion, mission, profession, vocation"
+            )));
+        }
+    }
+
+    let quadrants_json = serde_json::to_string(&body.quadrants)
+        .map_err(|_| HttpError::bad_request("bad quadrants"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO goal_alignment (goal_id, user_id, alignment_score, quadrants_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(goal_id) DO UPDATE SET
+          alignment_score = excluded.alignment_score,
+          quadrants_json = excluded.quadrants_json,
+          updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        "#,
+    )
+    .bind(&goal_id)
+    .bind(user_id)
+    .bind(body.alignment_score)
+    .bind(&quadrants_json)
+    .execute(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

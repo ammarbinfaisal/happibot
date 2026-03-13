@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
 FROM rust:1.93-bookworm AS builder
 
@@ -10,10 +10,22 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/usr/local/cargo/git \
+  mkdir -p src \
+  && printf '%s\n' 'fn main() {}' > src/main.rs \
+  && cargo fetch --locked \
+  && rm -rf src
+
 COPY src ./src
 COPY migrations ./migrations
 
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/usr/local/cargo/git \
+  --mount=type=cache,target=/build/target \
+  cargo build --release \
+  && cp /build/target/release/backend /build/backend
 
 FROM debian:bookworm-slim
 
@@ -26,7 +38,7 @@ RUN useradd -m -u 10001 app \
   && chown -R app:app /data
 
 WORKDIR /app
-COPY --from=builder /build/target/release/backend /app/backend
+COPY --from=builder /build/backend /app/backend
 
 USER app
 

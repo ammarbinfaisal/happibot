@@ -4,6 +4,8 @@ mod config;
 mod db;
 mod dotenv;
 mod http_error;
+mod openai;
+mod scheduler;
 mod state;
 mod telegram;
 mod user_id;
@@ -38,9 +40,10 @@ async fn async_main() -> anyhow::Result<()> {
         None => CorsLayer::permissive(),
     };
 
-    let app_state = AppState { db };
-
     telegram::spawn_set_webhook_on_startup();
+    scheduler::spawn_reminder_loop(db.clone());
+
+    let app_state = AppState { db };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
