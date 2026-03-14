@@ -176,7 +176,7 @@ export default function TodayClient() {
                       </span>
                     </div>
                     {g.completion_pct != null && (
-                      <div className="w-full rounded-full h-1.5" style={{ background: "var(--tg-theme-secondary-bg-color, #e5e7eb)" }}>
+                      <div className="w-full rounded-full h-1.5" style={{ background: "var(--tg-theme-secondary-bg-color, #2a2a2a)" }}>
                         <div
                           className="h-1.5 rounded-full"
                           style={{
@@ -225,7 +225,7 @@ export default function TodayClient() {
                   key={t}
                   className="text-xs px-2 py-0.5 rounded-full"
                   style={{
-                    background: "var(--tg-theme-secondary-bg-color, #f3f4f6)",
+                    background: "var(--tg-theme-secondary-bg-color, #2a2a2a)",
                     color: "var(--tg-theme-hint-color, #666)",
                   }}
                 >
@@ -239,7 +239,7 @@ export default function TodayClient() {
 
       {/* CTA */}
       <div className="sticky bottom-[calc(var(--app-tabbar-height)+var(--app-bottom-safe))] z-10">
-        <div className="rounded-2xl bg-[color:var(--tg-theme-secondary-bg-color,#f4f4f5)] p-3">
+        <div className="rounded-2xl bg-[color:var(--tg-theme-secondary-bg-color,#1e1e1e)] p-3">
           <Button
             size="l"
             stretched

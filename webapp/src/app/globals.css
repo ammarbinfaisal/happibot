@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: var(--tg-theme-bg-color, #ffffff);
-  --foreground: var(--tg-theme-text-color, #171717);
+  --background: var(--tg-theme-bg-color, #212121);
+  --foreground: var(--tg-theme-text-color, #f5f5f5);
 
   /* Thumb-friendly sizing defaults. */
   --app-tabbar-height: 64px;
@@ -32,8 +32,8 @@ body {
 
 .app-shell {
   min-height: 100svh;
-  background: var(--tg-theme-bg-color, #ffffff);
-  color: var(--tg-theme-text-color, #111111);
+  background: var(--tg-theme-bg-color, #212121);
+  color: var(--tg-theme-text-color, #f5f5f5);
   padding-bottom: calc(var(--app-tabbar-height) + var(--app-bottom-safe));
 }
 
@@ -44,4 +44,30 @@ body {
 /* Keep navigation and primary actions in the natural thumb zone. */
 .app-tabbar {
   padding-bottom: var(--app-bottom-safe);
+}
+
+/*
+ * Fix Telegram UI hover states in dark mode.
+ * The library hardcodes --tgui--tertiary_bg_color which clashes
+ * with Telegram's dark theme. Override to use theme-aware colors,
+ * and disable hover entirely on touch-only devices.
+ */
+
+/* On touch devices, suppress all Cell/List hover backgrounds */
+@media (hover: none) {
+  [class*="tgui-"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* On pointer devices, use theme-aware hover color instead of hardcoded */
+@media (hover: hover) and (pointer: fine) {
+  /* Override the tertiary_bg_color for the whole Telegram UI scope */
+  :root {
+    --tgui--tertiary_bg_color: color-mix(
+      in srgb,
+      var(--tg-theme-text-color, #ffffff) 8%,
+      var(--tg-theme-bg-color, #212121)
+    );
+  }
 }

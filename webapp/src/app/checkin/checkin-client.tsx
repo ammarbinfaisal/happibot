@@ -187,7 +187,7 @@ export default function CheckinClient() {
       </Section>
 
       <div className="sticky bottom-[calc(var(--app-tabbar-height)+var(--app-bottom-safe))] z-10">
-        <div className="rounded-2xl bg-[color:var(--tg-theme-secondary-bg-color,#f4f4f5)] p-3 space-y-2">
+        <div className="rounded-2xl bg-[color:var(--tg-theme-secondary-bg-color,#1e1e1e)] p-3 space-y-2">
           <Button size="l" stretched onClick={save} loading={saving}>
             Save check-in
           </Button>
