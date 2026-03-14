@@ -6,6 +6,14 @@ export type UserProfile = {
   quiet_hours_start: string | null;
   quiet_hours_end: string | null;
   onboarding_state: string;
+  reminder_preferences: ReminderPreferences;
+};
+
+export type ReminderPreferences = {
+  daily_checkin_time: string;
+  goal_update_time: string;
+  weekly_review_time: string;
+  weekly_review_day: string;
 };
 
 export type Goal = {
@@ -86,6 +94,7 @@ export type DashboardData = {
   weekly_stats: WeeklyReviewStats;
   ikigai: IkigaiProfile | null;
   goal_alignments: GoalAlignmentEntry[];
+  ikigai_svg: string | null;
   streak: StreakInfo;
 };
 
@@ -135,4 +144,3 @@ export async function apiFetch<T>(
   if (contentType.includes("application/json")) return (await res.json()) as T;
   return (await res.text()) as T;
 }
-

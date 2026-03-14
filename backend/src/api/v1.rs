@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::{Datelike, Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -14,9 +14,9 @@ use crate::{auth, http_error::HttpError, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/profile", get(get_user_profile))
+        .route("/profile", get(get_user_profile).post(update_user_profile))
         .route("/goals", get(list_goals).post(create_goal))
-        .route("/goals/{goal_id}", post(update_goal))
+        .route("/goals/{goal_id}", post(update_goal).delete(delete_goal))
         .route("/goals/{goal_id}/alignment", post(save_goal_alignment))
         .route("/progress", post(log_progress))
         .route("/progress/history", get(progress_history))
@@ -35,6 +35,14 @@ fn user_id_from(headers: &HeaderMap) -> Result<i64, HttpError> {
 }
 
 #[derive(Serialize)]
+struct ReminderPreferences {
+    daily_checkin_time: String,
+    goal_update_time: String,
+    weekly_review_time: String,
+    weekly_review_day: String,
+}
+
+#[derive(Serialize)]
 struct UserProfile {
     user_id: i64,
     timezone: String,
@@ -43,6 +51,7 @@ struct UserProfile {
     quiet_hours_start: Option<String>,
     quiet_hours_end: Option<String>,
     onboarding_state: String,
+    reminder_preferences: ReminderPreferences,
 }
 
 #[derive(sqlx::FromRow)]
@@ -54,6 +63,21 @@ struct UserProfileRow {
     quiet_hours_start: Option<String>,
     quiet_hours_end: Option<String>,
     onboarding_state: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReminderRow {
+    r#type: String,
+    schedule: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateUserProfileBody {
+    timezone: String,
+    daily_checkin_time: String,
+    goal_update_time: String,
+    weekly_review_time: String,
+    weekly_review_day: String,
 }
 
 async fn ensure_user(pool: &SqlitePool, user_id: i64) -> Result<(), HttpError> {
@@ -69,6 +93,166 @@ async fn ensure_user(pool: &SqlitePool, user_id: i64) -> Result<(), HttpError> {
     .execute(pool)
     .await
     .map_err(|_| HttpError::bad_request("db error"))?;
+    Ok(())
+}
+
+fn parse_hhmm(value: &str, field_name: &str) -> Result<NaiveTime, HttpError> {
+    NaiveTime::parse_from_str(value, "%H:%M")
+        .map_err(|_| HttpError::bad_request(format!("{field_name} must be HH:MM")))
+}
+
+fn normalize_weekday(value: &str) -> Result<&'static str, HttpError> {
+    match value.trim().to_uppercase().as_str() {
+        "MON" | "MONDAY" => Ok("MON"),
+        "TUE" | "TUESDAY" => Ok("TUE"),
+        "WED" | "WEDNESDAY" => Ok("WED"),
+        "THU" | "THURSDAY" => Ok("THU"),
+        "FRI" | "FRIDAY" => Ok("FRI"),
+        "SAT" | "SATURDAY" => Ok("SAT"),
+        "SUN" | "SUNDAY" => Ok("SUN"),
+        _ => Err(HttpError::bad_request(
+            "weekly_review_day must be a weekday like MON or SUN",
+        )),
+    }
+}
+
+fn daily_cron(time: NaiveTime) -> String {
+    format!("0 {} {} * * * *", time.minute(), time.hour())
+}
+
+fn weekly_cron(time: NaiveTime, weekday: &str) -> String {
+    format!("0 {} {} * * {} *", time.minute(), time.hour(), weekday)
+}
+
+fn parse_daily_time_from_cron(schedule: &str) -> Option<String> {
+    let parts: Vec<&str> = schedule.split_whitespace().collect();
+    if parts.len() != 7 {
+        return None;
+    }
+    let hour = parts[2].parse::<u32>().ok()?;
+    let minute = parts[1].parse::<u32>().ok()?;
+    let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+    Some(time.format("%H:%M").to_string())
+}
+
+fn parse_weekly_day_from_cron(schedule: &str) -> Option<String> {
+    let parts: Vec<&str> = schedule.split_whitespace().collect();
+    if parts.len() != 7 {
+        return None;
+    }
+    Some(parts[5].to_uppercase())
+}
+
+async fn load_reminder_preferences(
+    db: &SqlitePool,
+    user_id: i64,
+) -> Result<ReminderPreferences, HttpError> {
+    let rows: Vec<ReminderRow> = sqlx::query_as(
+        r#"
+        SELECT type, schedule
+        FROM reminders
+        WHERE user_id = ?
+          AND type IN ('daily_checkin', 'goal_update', 'weekly_review')
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let mut daily_checkin_time = "09:00".to_string();
+    let mut goal_update_time = "19:00".to_string();
+    let mut weekly_review_time = "18:00".to_string();
+    let mut weekly_review_day = "SUN".to_string();
+
+    for row in rows {
+        match row.r#type.as_str() {
+            "daily_checkin" => {
+                if let Some(time) = parse_daily_time_from_cron(&row.schedule) {
+                    daily_checkin_time = time;
+                }
+            }
+            "goal_update" => {
+                if let Some(time) = parse_daily_time_from_cron(&row.schedule) {
+                    goal_update_time = time;
+                }
+            }
+            "weekly_review" => {
+                if let Some(time) = parse_daily_time_from_cron(&row.schedule) {
+                    weekly_review_time = time;
+                }
+                if let Some(day) = parse_weekly_day_from_cron(&row.schedule) {
+                    weekly_review_day = day;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ReminderPreferences {
+        daily_checkin_time,
+        goal_update_time,
+        weekly_review_time,
+        weekly_review_day,
+    })
+}
+
+async fn upsert_default_reminder(
+    db: &SqlitePool,
+    user_id: i64,
+    timezone: &str,
+    reminder_type: &str,
+    schedule: &str,
+) -> Result<(), HttpError> {
+    let next_run_at = crate::scheduler::compute_next_run("cron", schedule, Utc::now(), timezone)
+        .map(|dt| dt.to_rfc3339());
+    let existing_id: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM reminders WHERE user_id = ? AND type = ? LIMIT 1")
+            .bind(user_id)
+            .bind(reminder_type)
+            .fetch_optional(db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+
+    match existing_id {
+        Some((id,)) => {
+            sqlx::query(
+                r#"
+                UPDATE reminders
+                SET schedule_kind = 'cron',
+                    schedule = ?,
+                    next_run_at = ?,
+                    enabled = 1,
+                    updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                WHERE id = ?
+                "#,
+            )
+            .bind(schedule)
+            .bind(next_run_at.as_deref())
+            .bind(&id)
+            .execute(db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+        }
+        None => {
+            sqlx::query(
+                r#"
+                INSERT INTO reminders (
+                  id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled
+                ) VALUES (?, ?, ?, 'cron', ?, '{}', ?, 1)
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(user_id)
+            .bind(reminder_type)
+            .bind(schedule)
+            .bind(next_run_at.as_deref())
+            .execute(db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -91,6 +275,7 @@ async fn get_user_profile(
     .fetch_one(&st.db)
     .await
     .map_err(|_| HttpError::bad_request("db error"))?;
+    let reminder_preferences = load_reminder_preferences(&st.db, user_id).await?;
 
     Ok(Json(UserProfile {
         user_id: row.user_id,
@@ -100,7 +285,82 @@ async fn get_user_profile(
         quiet_hours_start: row.quiet_hours_start,
         quiet_hours_end: row.quiet_hours_end,
         onboarding_state: row.onboarding_state,
+        reminder_preferences,
     }))
+}
+
+async fn update_user_profile(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateUserProfileBody>,
+) -> Result<Json<UserProfile>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    let timezone = body.timezone.trim();
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| HttpError::bad_request("timezone must be a valid IANA timezone"))?;
+    let daily_checkin_time = parse_hhmm(&body.daily_checkin_time, "daily_checkin_time")?;
+    let goal_update_time = parse_hhmm(&body.goal_update_time, "goal_update_time")?;
+    let weekly_review_time = parse_hhmm(&body.weekly_review_time, "weekly_review_time")?;
+    let weekly_review_day = normalize_weekday(&body.weekly_review_day)?;
+
+    let reminder_window_start = if daily_checkin_time <= goal_update_time {
+        daily_checkin_time.format("%H:%M").to_string()
+    } else {
+        goal_update_time.format("%H:%M").to_string()
+    };
+    let reminder_window_end = if daily_checkin_time <= goal_update_time {
+        goal_update_time.format("%H:%M").to_string()
+    } else {
+        daily_checkin_time.format("%H:%M").to_string()
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET timezone = ?,
+            reminder_window_start = ?,
+            reminder_window_end = ?,
+            updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(timezone)
+    .bind(&reminder_window_start)
+    .bind(&reminder_window_end)
+    .bind(user_id)
+    .execute(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    upsert_default_reminder(
+        &st.db,
+        user_id,
+        timezone,
+        "daily_checkin",
+        &daily_cron(daily_checkin_time),
+    )
+    .await?;
+    upsert_default_reminder(
+        &st.db,
+        user_id,
+        timezone,
+        "goal_update",
+        &daily_cron(goal_update_time),
+    )
+    .await?;
+    upsert_default_reminder(
+        &st.db,
+        user_id,
+        timezone,
+        "weekly_review",
+        &weekly_cron(weekly_review_time, weekly_review_day),
+    )
+    .await?;
+
+    get_user_profile(State(st), headers).await
 }
 
 #[derive(Deserialize)]
@@ -379,6 +639,67 @@ async fn update_goal(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+async fn purge_goal_data(db: &SqlitePool, user_id: i64, goal_id: &str) -> Result<(), HttpError> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let observation_ids: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM observations WHERE user_id = ? AND goal_id = ?")
+            .bind(user_id)
+            .bind(goal_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+
+    for (observation_id,) in &observation_ids {
+        sqlx::query(
+            "DELETE FROM embeddings WHERE user_id = ? AND source_type = 'observation' AND source_id = ?",
+        )
+        .bind(user_id)
+        .bind(observation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+    }
+
+    sqlx::query("DELETE FROM observations WHERE user_id = ? AND goal_id = ?")
+        .bind(user_id)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let result = sqlx::query("DELETE FROM goals WHERE id = ? AND user_id = ?")
+        .bind(goal_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(HttpError::bad_request("goal not found"));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(())
+}
+
+async fn delete_goal(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(goal_id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+    purge_goal_data(&st.db, user_id, &goal_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct LogProgressBody {
     goal_id: String,
@@ -561,6 +882,11 @@ async fn schedule_reminder(
 ) -> Result<impl IntoResponse, HttpError> {
     let user_id = user_id_from(&headers)?;
     ensure_user(&st.db, user_id).await?;
+    let timezone: String = sqlx::query_scalar("SELECT timezone FROM users WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
 
     if let Some(sd) = &body.start_date {
         NaiveDate::parse_from_str(sd, "%Y-%m-%d")
@@ -577,7 +903,7 @@ async fn schedule_reminder(
     let enabled = body.enabled.unwrap_or(true);
 
     let next_run_at =
-        crate::scheduler::compute_next_run(&schedule_kind, &body.schedule, Utc::now())
+        crate::scheduler::compute_next_run(&schedule_kind, &body.schedule, Utc::now(), &timezone)
             .map(|dt| dt.to_rfc3339());
 
     sqlx::query(
@@ -749,6 +1075,7 @@ struct DashboardResponse {
     weekly_stats: WeeklyReviewStats,
     ikigai: Option<IkigaiProfile>,
     goal_alignments: Vec<GoalAlignmentEntry>,
+    ikigai_svg: Option<String>,
     streak: StreakInfo,
 }
 
@@ -796,6 +1123,156 @@ struct GoalAlignmentEntry {
 struct StreakInfo {
     current_mood_streak: i64,
     current_progress_streak: i64,
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
+    let short: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{short}...")
+    } else {
+        short
+    }
+}
+
+fn ikigai_goal_position(entry: &GoalAlignmentEntry, index: usize) -> (f32, f32) {
+    if entry.quadrants.is_empty() {
+        return (180.0, 196.0);
+    }
+
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    let mut count = 0.0f32;
+    for quadrant in &entry.quadrants {
+        let (x, y) = match quadrant.as_str() {
+            "passion" => (146.0, 148.0),
+            "mission" => (146.0, 244.0),
+            "profession" => (214.0, 148.0),
+            "vocation" => (214.0, 244.0),
+            _ => continue,
+        };
+        sum_x += x;
+        sum_y += y;
+        count += 1.0;
+    }
+
+    if count == 0.0 {
+        return (180.0, 196.0);
+    }
+
+    let ring_offset = (index % 3) as f32 * 10.0;
+    let angle = (index as f32) * 0.9;
+    (
+        sum_x / count + angle.cos() * ring_offset,
+        sum_y / count + angle.sin() * ring_offset,
+    )
+}
+
+fn render_ikigai_svg(
+    profile: Option<&IkigaiProfile>,
+    goal_alignments: &[GoalAlignmentEntry],
+) -> Option<String> {
+    if profile.is_none() && goal_alignments.is_empty() {
+        return None;
+    }
+
+    let mission = profile
+        .and_then(|item| item.mission.as_deref())
+        .map(|value| truncate_label(value, 56))
+        .unwrap_or_else(|| "Your current ikigai direction".to_string());
+    let themes = profile
+        .map(|item| item.themes.iter().take(4).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let mut svg = String::from(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 420" fill="none" role="img" aria-label="Ikigai map">"##,
+    );
+    svg.push_str(
+        r##"<rect x="0" y="0" width="360" height="420" rx="28" fill="#FFF8ED"/><rect x="18" y="18" width="324" height="384" rx="24" fill="#FFFCF5" stroke="#E7D8BD"/>"##,
+    );
+    svg.push_str(&format!(
+        r##"<text x="180" y="48" text-anchor="middle" font-size="12" font-weight="700" fill="#815B2B" letter-spacing="1.6">IKIGAI SNAPSHOT</text><text x="180" y="72" text-anchor="middle" font-size="17" font-weight="700" fill="#1F2A1F">{}</text>"##,
+        xml_escape(&mission)
+    ));
+
+    let circles = [
+        (138, 156, "#F4A8A8", "What you love", 88, 118),
+        (222, 156, "#F5D06F", "What you're good at", 270, 118),
+        (138, 240, "#8FD3C7", "What the world needs", 80, 292),
+        (222, 240, "#83B6F2", "What sustains you", 278, 292),
+    ];
+    for (cx, cy, color, label, tx, ty) in circles {
+        svg.push_str(&format!(
+            r##"<circle cx="{cx}" cy="{cy}" r="72" fill="{color}" fill-opacity="0.22" stroke="{color}" stroke-opacity="0.55" stroke-width="1.5"/><text x="{tx}" y="{ty}" text-anchor="middle" font-size="11" font-weight="600" fill="#4B5563">{}</text>"##,
+            xml_escape(label)
+        ));
+    }
+
+    svg.push_str(
+        r##"<circle cx="180" cy="198" r="26" fill="#F2E8D8" stroke="#D2B98D"/><text x="180" y="194" text-anchor="middle" font-size="11" font-weight="700" fill="#5A4931">core</text><text x="180" y="208" text-anchor="middle" font-size="11" font-weight="700" fill="#5A4931">purpose</text>"##,
+    );
+
+    for (index, goal) in goal_alignments.iter().take(6).enumerate() {
+        let (x, y) = ikigai_goal_position(goal, index);
+        let width = 96.0f32;
+        let height = 30.0f32;
+        let label = truncate_label(&goal.goal_title, 16);
+        svg.push_str(&format!(
+            r##"<g><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="15" fill="#1F3B2F"/><text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10.5" font-weight="700" fill="#F8F4EA">{}</text><text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="9" font-weight="600" fill="#C9E0D1">{}%</text></g>"##,
+            x - width / 2.0,
+            y - height / 2.0,
+            width,
+            height,
+            x,
+            y - 1.0,
+            xml_escape(&label),
+            x,
+            y + 10.0,
+            goal.alignment_score
+        ));
+    }
+
+    if goal_alignments.len() > 6 {
+        svg.push_str(&format!(
+            r##"<text x="180" y="330" text-anchor="middle" font-size="11" font-weight="600" fill="#6B7280">+{} more aligned goals in your cache</text>"##,
+            goal_alignments.len() - 6
+        ));
+    }
+
+    if !themes.is_empty() {
+        let mut x = 52.0f32;
+        let y = 364.0f32;
+        for theme in themes {
+            let label = truncate_label(&theme, 14);
+            let width = (label.chars().count() as f32 * 6.3) + 26.0;
+            svg.push_str(&format!(
+                r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="24" rx="12" fill="#F2E8D8"/><text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10.5" font-weight="600" fill="#6F5A3C">{}</text>"##,
+                x,
+                y,
+                width,
+                x + width / 2.0,
+                y + 15.0,
+                xml_escape(&label)
+            ));
+            x += width + 8.0;
+            if x > 300.0 {
+                break;
+            }
+        }
+    }
+
+    svg.push_str("</svg>");
+    Some(svg)
 }
 
 async fn get_dashboard(
@@ -982,6 +1459,7 @@ async fn get_dashboard(
             }
         })
         .collect();
+    let ikigai_svg = render_ikigai_svg(ikigai.as_ref(), &goal_alignments);
 
     // Streaks
     let mood_streak = compute_streak(
@@ -1012,6 +1490,7 @@ async fn get_dashboard(
         },
         ikigai,
         goal_alignments,
+        ikigai_svg,
         streak: StreakInfo {
             current_mood_streak: mood_streak,
             current_progress_streak: progress_streak,

@@ -11,8 +11,8 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-  --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=happi-cargo-registry,sharing=locked \
+  --mount=type=cache,target=/usr/local/cargo/git,id=happi-cargo-git,sharing=locked \
   mkdir -p src \
   && printf '%s\n' 'fn main() {}' > src/main.rs \
   && cargo fetch --locked \
@@ -21,10 +21,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY src ./src
 COPY migrations ./migrations
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-  --mount=type=cache,target=/usr/local/cargo/git \
-  --mount=type=cache,target=/build/target \
-  cargo build --release \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=happi-cargo-registry,sharing=locked \
+  --mount=type=cache,target=/usr/local/cargo/git,id=happi-cargo-git,sharing=locked \
+  --mount=type=cache,target=/build/target,id=happi-cargo-target,sharing=locked \
+  cargo build --release --locked \
   && cp /build/target/release/backend /build/backend
 
 FROM debian:bookworm-slim

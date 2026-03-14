@@ -31,6 +31,10 @@ handle_user_message()
 │   │   ├─ Grounding rules: use only supplied context, no invented memories/facts
 │   │   ├─ Output contract: strict JSON schema, no free-form prose
 │   │   └─ Reply quality bar: warm, concise, specific, action-oriented
+│   ├─ Responses API observability:
+│   │   └─ Any tool-call output item emitted by OpenAI is logged in `openai.rs`
+│   │      with an explicit RFC3339 UTC timestamp, model, schema name, call id,
+│   │      tool name, and status
 │   ├─ mood     → log happiness/energy/stress
 │   ├─ progress → log progress on matched goal
 │   ├─ create_goal → create new goal
@@ -68,6 +72,26 @@ The agent prompt is tuned around GPT-5.4 prompt-guidance patterns:
 - **Durable memory only**: observation generation prefers stable patterns,
   motivational drivers, risks, coaching preferences, milestones, and
   mood-to-goal connections. It avoids obvious one-off facts.
+
+## Observability
+
+- OpenAI Responses API calls are instrumented at the client boundary in
+  `backend/src/openai.rs`.
+- Each structured Responses API request now logs model, schema name, input size,
+  output size, tool-call count, and end-to-end request latency.
+- Embedding and transcription requests also log per-call latency and payload
+  sizes.
+- If OpenAI returns tool-call-style output items such as `function_call` or
+  `web_search_call`, the backend emits one structured log event per item.
+- Each event includes an explicit RFC3339 UTC timestamp plus the model, schema
+  name, request latency, tool-call type, tool/call identifier, and status.
+- Telegram message handling logs a per-message timing breakdown for user
+  upsert, context loading, semantic search, intent parsing, execution,
+  persistence, and reply send.
+- The async memory pipeline logs its own timing separately so background work is
+  visible without conflating it with user-visible reply latency.
+- Normal assistant message output is not duplicated into this tool-call log
+  stream.
 
 ## Coaching Policy
 

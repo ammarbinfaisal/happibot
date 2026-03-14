@@ -21,6 +21,7 @@ struct DueReminder {
 #[derive(sqlx::FromRow)]
 struct GoalTitle {
     title: String,
+    cadence: Option<String>,
 }
 
 pub fn spawn_reminder_loop(db: SqlitePool) {
@@ -82,7 +83,7 @@ async fn process_one_reminder(
 
     // Load user's active goals for context
     let goals: Vec<GoalTitle> = sqlx::query_as(
-        "SELECT title FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
+        "SELECT title, cadence FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
     )
     .bind(reminder.user_id)
     .fetch_all(db)
@@ -94,7 +95,12 @@ async fn process_one_reminder(
         let items: Vec<String> = goals
             .iter()
             .enumerate()
-            .map(|(i, g)| format!("{}. {}", i + 1, g.title))
+            .map(|(i, g)| match g.cadence.as_deref() {
+                Some(cadence) if !cadence.trim().is_empty() => {
+                    format!("{}. {} [{}]", i + 1, g.title, cadence)
+                }
+                _ => format!("{}. {}", i + 1, g.title),
+            })
             .collect();
         format!("\n\nYour active goals:\n{}", items.join("\n"))
     };
@@ -113,7 +119,12 @@ async fn process_one_reminder(
     );
 
     // Compute next run and update
-    let next_run = compute_next_run(&reminder.schedule_kind, &reminder.schedule, now);
+    let next_run = compute_next_run(
+        &reminder.schedule_kind,
+        &reminder.schedule,
+        now,
+        &reminder.timezone,
+    );
 
     match next_run {
         Some(next) => {
@@ -187,11 +198,17 @@ pub fn compute_next_run(
     schedule_kind: &str,
     schedule: &str,
     after: DateTime<Utc>,
+    timezone: &str,
 ) -> Option<DateTime<Utc>> {
     match schedule_kind {
         "cron" => {
             let sched = Schedule::from_str(schedule).ok()?;
-            sched.after(&after).next()
+            let tz = timezone.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC);
+            let local_after = after.with_timezone(&tz);
+            sched
+                .after(&local_after)
+                .next()
+                .map(|next_local| next_local.with_timezone(&Utc))
         }
         _ => {
             tracing::warn!(

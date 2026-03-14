@@ -1,254 +1,238 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  Button,
-  Cell,
-  List,
-  Placeholder,
-  Section,
-  Spinner,
-} from "@telegram-apps/telegram-ui";
+import { startTransition, useEffect, useState } from "react";
+import { Button, Cell, List, Placeholder, Section, Spinner } from "@telegram-apps/telegram-ui";
 import { useRawInitData } from "@telegram-apps/sdk-react";
 
-import type { DashboardData } from "@/lib/api";
+import type { DashboardData, GoalWithProgress } from "@/lib/api";
 import { apiFetch } from "@/lib/api";
 import { ProgressSparkline } from "@/components/ProgressSparkline";
-import { IkigaiDiagram } from "@/components/IkigaiDiagram";
 
-function MiniMoodChart({ data }: { data: { date: string; happiness: number; energy: number; stress: number }[] }) {
-  if (data.length < 2) return null;
+function todayISO() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 
-  const W = 280;
-  const H = 80;
-  const PAD = { top: 8, right: 8, bottom: 16, left: 24 };
-  const cw = W - PAD.left - PAD.right;
-  const ch = H - PAD.top - PAD.bottom;
+type DraftMap = Record<string, string>;
 
-  const series = [
-    { key: "happiness" as const, color: "#22c55e" },
-    { key: "energy" as const, color: "#3b82f6" },
-    { key: "stress" as const, color: "#ef4444" },
-  ];
-
-  const toPath = (key: "happiness" | "energy" | "stress") => {
-    return data
-      .map((p, i) => {
-        const x = PAD.left + (i / (data.length - 1)) * cw;
-        const y = PAD.top + ch - ((p[key] - 1) / 9) * ch;
-        return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join("");
-  };
-
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: W }}>
-      {series.map((s) => (
-        <path key={s.key} d={toPath(s.key)} fill="none" stroke={s.color} strokeWidth={1.5} strokeOpacity={0.7} />
-      ))}
-    </svg>
-  );
+function defaultValue(goal: GoalWithProgress) {
+  return goal.latest_value == null ? "" : String(goal.latest_value);
 }
 
 export default function TodayClient() {
   const initData = useRawInitData();
   const [loading, setLoading] = useState(true);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [noteDrafts, setNoteDrafts] = useState<DraftMap>({});
+  const [valueDrafts, setValueDrafts] = useState<DraftMap>({});
+  const [savingGoalId, setSavingGoalId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
 
-    apiFetch<DashboardData>(initData, "/v1/dashboard")
-      .then((d) => {
-        if (!cancelled) setDashboard(d);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
+    async function loadDashboard() {
+      setLoading(true);
+      setPageError(null);
+
+      try {
+        const nextDashboard = await apiFetch<DashboardData>(initData, "/v1/dashboard");
+        if (cancelled) return;
+
+        setDashboard(nextDashboard);
+        setNoteDrafts((current) => {
+          const next = { ...current };
+          for (const goal of nextDashboard.goals) {
+            next[goal.id] = next[goal.id] ?? "";
+          }
+          return next;
+        });
+        setValueDrafts((current) => {
+          const next = { ...current };
+          for (const goal of nextDashboard.goals) {
+            next[goal.id] = next[goal.id] ?? defaultValue(goal);
+          }
+          return next;
+        });
+      } catch (nextError) {
+        if (!cancelled) {
+          setPageError(nextError instanceof Error ? nextError.message : String(nextError));
+        }
+      } finally {
         if (!cancelled) setLoading(false);
-      });
+      }
+    }
+
+    loadDashboard();
 
     return () => {
       cancelled = true;
     };
   }, [initData]);
 
+  async function refreshDashboard() {
+    const nextDashboard = await apiFetch<DashboardData>(initData, "/v1/dashboard");
+    startTransition(() => {
+      setDashboard(nextDashboard);
+      setValueDrafts((current) => {
+        const next = { ...current };
+        for (const goal of nextDashboard.goals) {
+          next[goal.id] = defaultValue(goal);
+        }
+        return next;
+      });
+    });
+  }
+
+  async function submitProgress(goal: GoalWithProgress) {
+    const rawNote = noteDrafts[goal.id]?.trim() ?? "";
+    const rawValue = valueDrafts[goal.id]?.trim() ?? "";
+    const parsedValue = rawValue ? Number(rawValue) : null;
+
+    if (!rawNote && !rawValue) return;
+    if (rawValue && Number.isNaN(parsedValue)) {
+      setSubmitError(`Progress value for "${goal.title}" must be a number.`);
+      return;
+    }
+
+    setSubmitError(null);
+    setSavingGoalId(goal.id);
+
+    try {
+      await apiFetch<string>(initData, "/v1/progress", {
+        method: "POST",
+        body: JSON.stringify({
+          goal_id: goal.id,
+          date: todayISO(),
+          value: parsedValue,
+          note: rawNote || null,
+          confidence: 4,
+          idempotency_key: `${goal.id}:${todayISO()}:${rawValue}:${rawNote}`,
+        }),
+      });
+
+      setNoteDrafts((current) => ({ ...current, [goal.id]: "" }));
+      await refreshDashboard();
+    } catch (nextError) {
+      setSubmitError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setSavingGoalId(null);
+    }
+  }
+
   if (loading) {
     return (
-      <Placeholder header="Loading" description={<Spinner size="l" />}>
+      <Placeholder header="Loading progress" description={<Spinner size="l" />}>
         <div />
       </Placeholder>
     );
   }
 
-  if (error || !dashboard) {
+  if (pageError || !dashboard) {
     return (
-      <Placeholder header="API Error" description={error ?? "Failed to load"}>
+      <Placeholder header="API Error" description={pageError ?? "Failed to load progress"}>
         <div />
       </Placeholder>
     );
   }
-
-  const { goals, mood_trend, weekly_stats, ikigai, goal_alignments, streak } = dashboard;
-
-  const hasStreak = streak.current_mood_streak > 0 || streak.current_progress_streak > 0;
 
   return (
     <div className="space-y-4">
-      {/* Streaks */}
-      {hasStreak && (
-        <Section header="Streaks">
-          <List>
-            {streak.current_mood_streak > 0 && (
-              <Cell
-                before={<span className="text-lg">🔥</span>}
-                subtitle="consecutive days"
-              >
-                {streak.current_mood_streak}-day mood streak
-              </Cell>
-            )}
-            {streak.current_progress_streak > 0 && (
-              <Cell
-                before={<span className="text-lg">⚡</span>}
-                subtitle="consecutive days"
-              >
-                {streak.current_progress_streak}-day progress streak
-              </Cell>
-            )}
-          </List>
-        </Section>
-      )}
-
-      {/* Weekly pulse */}
       <Section header="This week">
         <List>
-          <Cell subtitle={`${weekly_stats.active_goals} active goals`}>
-            {weekly_stats.mood_days} mood logs · {weekly_stats.progress_logs} progress logs
+          <Cell subtitle={`${dashboard.weekly_stats.active_goals} active goals`}>
+            {dashboard.weekly_stats.progress_logs} progress logs this week
+          </Cell>
+          <Cell subtitle="Current streak">
+            {dashboard.streak.current_progress_streak} consecutive days with progress
           </Cell>
         </List>
-        {mood_trend.length >= 2 && (
-          <div className="px-3 py-2">
-            <MiniMoodChart data={mood_trend.slice(-7)} />
-            <div className="flex justify-center gap-3 mt-1">
-              {[
-                { label: "Happy", color: "#22c55e" },
-                { label: "Energy", color: "#3b82f6" },
-                { label: "Stress", color: "#ef4444" },
-              ].map((s) => (
-                <div key={s.label} className="flex items-center gap-1 text-xs" style={{ color: s.color }}>
-                  <span className="inline-block w-2 h-0.5 rounded" style={{ background: s.color }} />
-                  {s.label}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </Section>
 
-      {/* Goal progress cards */}
-      <Section header="Goals">
-        {goals.length > 0 ? (
-          <List>
-            {goals.map((g) => (
-              <Cell
-                key={g.id}
-                subtitle={
-                  <div className="space-y-1">
-                    {g.why && (
-                      <div className="text-xs" style={{ color: "var(--tg-theme-hint-color, #888)" }}>
-                        {g.why}
-                      </div>
-                    )}
-                    <div className="flex items-center gap-2">
-                      {g.progress_last_7d.length >= 2 && (
-                        <ProgressSparkline
-                          data={g.progress_last_7d}
-                          width={100}
-                          height={24}
-                        />
-                      )}
-                      <span className="text-xs" style={{ color: "var(--tg-theme-hint-color, #888)" }}>
-                        {g.total_logs} logs
-                      </span>
-                    </div>
-                    {g.completion_pct != null && (
-                      <div className="w-full rounded-full h-1.5" style={{ background: "var(--tg-theme-secondary-bg-color, #2a2a2a)" }}>
-                        <div
-                          className="h-1.5 rounded-full"
-                          style={{
-                            width: `${Math.min(g.completion_pct, 100)}%`,
-                            background: g.completion_pct >= 100 ? "#22c55e" : "var(--tg-theme-button-color, #3b82f6)",
-                          }}
-                        />
-                      </div>
-                    )}
+      <Section header="Log progress">
+        {submitError ? <p className="settings-error">{submitError}</p> : null}
+        {dashboard.goals.length > 0 ? (
+          <div className="space-y-3">
+            {dashboard.goals.map((goal) => (
+              <article key={goal.id} className="progress-card">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="progress-card-title">{goal.title}</h3>
+                    {goal.why ? <p className="progress-card-copy">{goal.why}</p> : null}
                   </div>
-                }
-              >
-                {g.title}
-              </Cell>
+                  {goal.completion_pct != null ? (
+                    <div className="progress-chip">{Math.round(goal.completion_pct)}%</div>
+                  ) : null}
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_104px]">
+                  <label className="progress-field">
+                    <span className="progress-field-label">Update</span>
+                    <textarea
+                      className="progress-textarea"
+                      rows={3}
+                      placeholder="What moved forward?"
+                      value={noteDrafts[goal.id] ?? ""}
+                      onChange={(event) =>
+                        setNoteDrafts((current) => ({
+                          ...current,
+                          [goal.id]: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="progress-field">
+                    <span className="progress-field-label">
+                      {goal.metric || goal.target_text || "Value"}
+                    </span>
+                    <input
+                      className="progress-input"
+                      inputMode="decimal"
+                      placeholder="Optional"
+                      value={valueDrafts[goal.id] ?? ""}
+                      onChange={(event) =>
+                        setValueDrafts((current) => ({
+                          ...current,
+                          [goal.id]: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    {goal.progress_last_7d.length >= 2 ? (
+                      <ProgressSparkline data={goal.progress_last_7d} width={118} height={26} />
+                    ) : null}
+                    <span className="progress-card-meta">{goal.total_logs} total logs</span>
+                  </div>
+
+                  <Button
+                    size="m"
+                    onClick={() => submitProgress(goal)}
+                    disabled={savingGoalId === goal.id}
+                  >
+                    {savingGoalId === goal.id ? "Saving..." : "Save"}
+                  </Button>
+                </div>
+              </article>
             ))}
-          </List>
+          </div>
         ) : (
           <Placeholder
-            header="No goals yet"
-            description="Create one goal and keep it tiny."
+            header="No active goals yet"
+            description="Create goals in chat with Happi, then use this screen to log progress."
           >
             <div />
           </Placeholder>
         )}
       </Section>
-
-      {/* Ikigai alignment */}
-      {(goal_alignments.length > 0 || ikigai) && (
-        <Section header="Ikigai alignment">
-          {ikigai?.mission && (
-            <List>
-              <Cell subtitle="Your mission">
-                {ikigai.mission}
-              </Cell>
-            </List>
-          )}
-          {goal_alignments.length > 0 && (
-            <div className="px-3 py-2 flex justify-center">
-              <IkigaiDiagram goals={goal_alignments} size={240} />
-            </div>
-          )}
-          {ikigai?.themes && ikigai.themes.length > 0 && (
-            <div className="px-3 pb-2 flex flex-wrap gap-1">
-              {ikigai.themes.map((t) => (
-                <span
-                  key={t}
-                  className="text-xs px-2 py-0.5 rounded-full"
-                  style={{
-                    background: "var(--tg-theme-secondary-bg-color, #2a2a2a)",
-                    color: "var(--tg-theme-hint-color, #666)",
-                  }}
-                >
-                  {t}
-                </span>
-              ))}
-            </div>
-          )}
-        </Section>
-      )}
-
-      {/* CTA */}
-      <div className="sticky bottom-[calc(var(--app-tabbar-height)+var(--app-bottom-safe))] z-10">
-        <div className="rounded-2xl bg-[color:var(--tg-theme-secondary-bg-color,#1e1e1e)] p-3">
-          <Button
-            size="l"
-            stretched
-            onClick={() => (window.location.href = "/checkin")}
-          >
-            Log mood + quick check-in
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }

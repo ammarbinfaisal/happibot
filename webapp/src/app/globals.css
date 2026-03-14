@@ -41,6 +41,110 @@ body {
   padding: 16px 16px 24px;
 }
 
+.settings-card,
+.progress-card,
+.ikigai-frame {
+  border: 1px solid color-mix(in srgb, var(--tg-theme-text-color, #fff) 10%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--tg-theme-secondary-bg-color, #262626) 82%, white 6%),
+      color-mix(in srgb, var(--tg-theme-bg-color, #1d1d1d) 94%, black 2%)
+    );
+  border-radius: 24px;
+}
+
+.settings-card,
+.progress-card {
+  padding: 16px;
+}
+
+.settings-copy,
+.progress-card-copy,
+.progress-card-meta,
+.settings-error {
+  color: var(--tg-theme-hint-color, #9ca3af);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.settings-card {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-field,
+.progress-field {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-label,
+.progress-field-label {
+  color: var(--tg-theme-hint-color, #9ca3af);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.settings-input,
+.progress-input,
+.progress-textarea {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--tg-theme-text-color, #fff) 12%, transparent);
+  background: color-mix(in srgb, var(--tg-theme-bg-color, #18181b) 88%, white 4%);
+  color: var(--tg-theme-text-color, #f5f5f5);
+  border-radius: 16px;
+  padding: 12px 14px;
+  font: inherit;
+}
+
+.settings-input:focus,
+.progress-input:focus,
+.progress-textarea:focus {
+  outline: 2px solid color-mix(in srgb, var(--tg-theme-button-color, #3b82f6) 72%, white 10%);
+  outline-offset: 1px;
+}
+
+.progress-textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.progress-card {
+  display: grid;
+  gap: 14px;
+}
+
+.progress-card-title {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.progress-chip {
+  min-width: 58px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tg-theme-button-color, #3b82f6) 18%, transparent);
+  color: var(--tg-theme-button-color, #3b82f6);
+  font-size: 13px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.ikigai-frame {
+  overflow: hidden;
+  padding: 8px;
+}
+
+.ikigai-frame svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 /* Keep navigation and primary actions in the natural thumb zone. */
 .app-tabbar {
   padding-bottom: var(--app-bottom-safe);

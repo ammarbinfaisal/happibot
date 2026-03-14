@@ -7,6 +7,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::{openai, state::AppState};
@@ -176,30 +177,46 @@ async fn handle_user_message(
     user_id: i64,
     msg: Message,
 ) -> anyhow::Result<()> {
+    let started_at = Instant::now();
+    let mut reminder_setup_ms = None;
+    let mut voice_transcription_ms = None;
+    let mut voice_echo_ms = None;
+    let mut semantic_search_ms = None;
+
     // Ensure user exists
+    let user_upsert_started_at = Instant::now();
     let result =
         sqlx::query("INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING")
             .bind(user_id)
             .execute(&db)
             .await?;
+    let user_upsert_ms = user_upsert_started_at.elapsed().as_millis() as u64;
+    let is_new_user = result.rows_affected() > 0;
 
     // New user: set up default reminders
-    if result.rows_affected() > 0 {
+    if is_new_user {
+        let reminders_started_at = Instant::now();
         if let Err(e) = setup_default_reminders(&db, user_id).await {
             tracing::error!(user_id, ?e, "failed to set up default reminders");
         }
+        reminder_setup_ms = Some(reminders_started_at.elapsed().as_millis() as u64);
     }
 
     // Get the text: either from text field or transcribe voice
+    let message_kind = if msg.voice.is_some() { "voice" } else { "text" };
     let user_text = if let Some(voice) = msg.voice {
         // Send typing indicator
         let _ = send_telegram_action(chat_id, "typing").await;
 
+        let transcription_started_at = Instant::now();
         let transcript = transcribe_voice(&voice.file_id).await?;
+        voice_transcription_ms = Some(transcription_started_at.elapsed().as_millis() as u64);
         tracing::info!(chat_id, transcript = %transcript, "voice transcribed");
 
         // Let user know what we heard
+        let voice_echo_started_at = Instant::now();
         send_telegram_message(chat_id, &format!("I heard: \"{transcript}\"")).await?;
+        voice_echo_ms = Some(voice_echo_started_at.elapsed().as_millis() as u64);
         transcript
     } else if let Some(text) = msg.text {
         text
@@ -212,10 +229,13 @@ async fn handle_user_message(
     }
 
     // Send typing indicator
+    let typing_indicator_started_at = Instant::now();
     let _ = send_telegram_action(chat_id, "typing").await;
+    let typing_indicator_ms = typing_indicator_started_at.elapsed().as_millis() as u64;
 
     // Load recent chat history for direct context
     let history_window = crate::config::chat_history_window();
+    let history_started_at = Instant::now();
     let history: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
     )
@@ -226,14 +246,17 @@ async fn handle_user_message(
     .into_iter()
     .rev()
     .collect();
+    let history_load_ms = history_started_at.elapsed().as_millis() as u64;
 
     // Load active goals with richer context for the LLM
+    let goals_started_at = Instant::now();
     let goals: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT title, why, cadence, deadline FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
     )
     .bind(user_id)
     .fetch_all(&db)
     .await?;
+    let goal_load_ms = goals_started_at.elapsed().as_millis() as u64;
     let goal_titles: Vec<String> = goals
         .iter()
         .map(|(title, why, cadence, deadline)| {
@@ -252,31 +275,42 @@ async fn handle_user_message(
         .collect();
 
     // Load memory context: observations + semantic search
+    let observations_started_at = Instant::now();
     let observations = crate::memory::load_active_observations(&db, user_id)
         .await
         .unwrap_or_default();
+    let observations_load_ms = observations_started_at.elapsed().as_millis() as u64;
 
     // Embed the user message and search for relevant past context
-    let retrieved_context = match openai::embed(&[&user_text]).await {
-        Ok(embs) if !embs.is_empty() => {
-            let top_k = crate::config::semantic_search_top_k();
-            let results = crate::memory::search_similar(
-                &db,
-                user_id,
-                &embs[0],
-                &["chat", "observation"],
-                top_k,
-            )
-            .await
-            .unwrap_or_default();
-            crate::memory::load_chat_content(&db, &results)
+    let semantic_search_used = crate::memory::should_use_semantic_search(&user_text);
+    let retrieved_context = if semantic_search_used {
+        let semantic_search_started_at = Instant::now();
+        let context = match openai::embed(&[&user_text]).await {
+            Ok(embs) if !embs.is_empty() => {
+                let top_k = crate::config::semantic_search_top_k();
+                let results = crate::memory::search_similar(
+                    &db,
+                    user_id,
+                    &embs[0],
+                    &["chat", "observation"],
+                    top_k,
+                )
                 .await
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
+                .unwrap_or_default();
+                crate::memory::load_chat_content(&db, &results)
+                    .await
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        semantic_search_ms = Some(semantic_search_started_at.elapsed().as_millis() as u64);
+        context
+    } else {
+        Vec::new()
     };
 
     // Parse intent with full memory context
+    let parse_intent_started_at = Instant::now();
     let intent = openai::parse_intent_with_memory(
         &user_text,
         &history,
@@ -285,8 +319,11 @@ async fn handle_user_message(
         &retrieved_context,
     )
     .await?;
+    let parse_intent_ms = parse_intent_started_at.elapsed().as_millis() as u64;
+    let intent_kind = parsed_intent_kind(&intent);
     tracing::info!(chat_id, ?intent, "parsed intent");
 
+    let execute_intent_started_at = Instant::now();
     let reply = match intent {
         openai::ParsedIntent::Mood {
             happiness,
@@ -299,17 +336,58 @@ async fn handle_user_message(
             value,
             note,
         } => execute_progress(&db, user_id, &goal_title, value, note.as_deref()).await?,
-        openai::ParsedIntent::CreateGoal { title, why } => {
-            execute_create_goal(&db, user_id, &title, why.as_deref()).await?
+        openai::ParsedIntent::CreateGoal {
+            title,
+            why,
+            cadence,
+        } => execute_create_goal(&db, user_id, &title, &why, &cadence).await?,
+        openai::ParsedIntent::DeleteGoal { goal_title } => {
+            execute_delete_goal(&db, user_id, &goal_title).await?
         }
         openai::ParsedIntent::Chat { reply } => reply,
     };
+    let execute_intent_ms = execute_intent_started_at.elapsed().as_millis() as u64;
 
     // Store conversation in history (returns the user message row ID)
+    let persist_chat_started_at = Instant::now();
     let user_msg_id = save_chat_message(&db, user_id, "user", &user_text).await?;
     save_chat_message(&db, user_id, "assistant", &reply).await?;
+    let persist_chat_ms = persist_chat_started_at.elapsed().as_millis() as u64;
 
+    let send_reply_started_at = Instant::now();
     send_telegram_message(chat_id, &reply).await?;
+    let send_reply_ms = send_reply_started_at.elapsed().as_millis() as u64;
+    let total_before_async_ms = started_at.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        chat_id,
+        user_id,
+        message_kind,
+        intent_kind,
+        is_new_user,
+        user_text_chars = user_text.chars().count(),
+        reply_chars = reply.chars().count(),
+        history_messages = history.len(),
+        active_goals = goal_titles.len(),
+        active_observations = observations.len(),
+        retrieved_context_items = retrieved_context.len(),
+        semantic_search_used,
+        user_upsert_ms,
+        reminder_setup_ms,
+        voice_transcription_ms,
+        voice_echo_ms,
+        typing_indicator_ms,
+        history_load_ms,
+        goal_load_ms,
+        observations_load_ms,
+        semantic_search_ms,
+        parse_intent_ms,
+        execute_intent_ms,
+        persist_chat_ms,
+        send_reply_ms,
+        total_before_async_ms,
+        "telegram message timing"
+    );
 
     // Async post-message pipeline: embed chat turn + generate observations
     let db_clone = db.clone();
@@ -329,6 +407,16 @@ async fn handle_user_message(
     });
 
     Ok(())
+}
+
+fn parsed_intent_kind(intent: &openai::ParsedIntent) -> &'static str {
+    match intent {
+        openai::ParsedIntent::Mood { .. } => "mood",
+        openai::ParsedIntent::Progress { .. } => "progress",
+        openai::ParsedIntent::CreateGoal { .. } => "create_goal",
+        openai::ParsedIntent::DeleteGoal { .. } => "delete_goal",
+        openai::ParsedIntent::Chat { .. } => "chat",
+    }
 }
 
 // ── Intent executors ──
@@ -389,29 +477,10 @@ async fn execute_progress(
     value: Option<f64>,
     note: Option<&str>,
 ) -> anyhow::Result<String> {
-    // Find the best matching active goal
-    let goal: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, title FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
-    )
-    .bind(user_id)
-    .fetch_all(db)
-    .await?
-    .into_iter()
-    .find(|(_, title): &(String, String)| {
-        title.to_lowercase().contains(&goal_title.to_lowercase())
-            || goal_title.to_lowercase().contains(&title.to_lowercase())
-    });
-
-    let (goal_id, goal_title) = match goal {
+    let (goal_id, goal_title) = match find_matching_active_goal(db, user_id, goal_title).await? {
         Some(g) => g,
         None => {
-            // List active goals for the user
-            let goals: Vec<(String,)> =
-                sqlx::query_as("SELECT title FROM goals WHERE user_id = ? AND status = 'active'")
-                    .bind(user_id)
-                    .fetch_all(db)
-                    .await?;
-
+            let goals = list_active_goal_titles(db, user_id).await?;
             if goals.is_empty() {
                 return Ok(
                     "You don't have any active goals yet. Tell me a goal you'd like to work on!"
@@ -422,7 +491,7 @@ async fn execute_progress(
             let list = goals
                 .iter()
                 .enumerate()
-                .map(|(i, (t,))| format!("{}. {t}", i + 1))
+                .map(|(i, title)| format!("{}. {title}", i + 1))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -458,28 +527,115 @@ async fn execute_create_goal(
     db: &SqlitePool,
     user_id: i64,
     title: &str,
-    why: Option<&str>,
+    why: &str,
+    cadence: &str,
 ) -> anyhow::Result<String> {
     let id = Uuid::new_v4().to_string();
 
     sqlx::query(
         r#"
-        INSERT INTO goals (id, user_id, title, why, tags_json)
-        VALUES (?, ?, ?, ?, '[]')
+        INSERT INTO goals (id, user_id, title, why, cadence, tags_json)
+        VALUES (?, ?, ?, ?, ?, '[]')
         "#,
     )
     .bind(&id)
     .bind(user_id)
     .bind(title)
     .bind(why)
+    .bind(cadence)
     .execute(db)
     .await?;
 
     Ok(format!(
-        "🎯 Goal created: \"{title}\"{}You can log progress anytime by telling me about it!",
-        why.map(|w| format!("\nWhy: {w}\n"))
-            .unwrap_or_else(|| "\n".to_string())
+        "🎯 Goal created: \"{title}\"\nWhy: {why}\nCadence: {cadence}\nTell me about your progress anytime and I'll log it."
     ))
+}
+
+async fn execute_delete_goal(
+    db: &SqlitePool,
+    user_id: i64,
+    goal_title: &str,
+) -> anyhow::Result<String> {
+    let (goal_id, matched_title) = match find_matching_active_goal(db, user_id, goal_title).await? {
+        Some(goal) => goal,
+        None => {
+            let goals = list_active_goal_titles(db, user_id).await?;
+            if goals.is_empty() {
+                return Ok("You don't have any active goals to delete.".to_string());
+            }
+
+            let list = goals
+                .iter()
+                .enumerate()
+                .map(|(i, title)| format!("{}. {title}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            return Ok(format!(
+                "I couldn't match \"{goal_title}\" to an active goal. Your active goals:\n{list}\n\nWhich one should I delete?"
+            ));
+        }
+    };
+
+    let mut tx = db.begin().await?;
+    let observation_ids: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM observations WHERE user_id = ? AND goal_id = ?")
+            .bind(user_id)
+            .bind(&goal_id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+    for (observation_id,) in &observation_ids {
+        sqlx::query("DELETE FROM embeddings WHERE user_id = ? AND source_type = 'observation' AND source_id = ?")
+            .bind(user_id)
+            .bind(observation_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    sqlx::query("DELETE FROM observations WHERE user_id = ? AND goal_id = ?")
+        .bind(user_id)
+        .bind(&goal_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM goals WHERE id = ? AND user_id = ?")
+        .bind(&goal_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(format!(
+        "🗑 Deleted goal \"{matched_title}\" and purged its structured goal data."
+    ))
+}
+
+async fn find_matching_active_goal(
+    db: &SqlitePool,
+    user_id: i64,
+    goal_title: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    let goals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, title FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(goals.into_iter().find(|(_, title)| {
+        let title_lower = title.to_lowercase();
+        let goal_lower = goal_title.to_lowercase();
+        title_lower.contains(&goal_lower) || goal_lower.contains(&title_lower)
+    }))
+}
+
+async fn list_active_goal_titles(db: &SqlitePool, user_id: i64) -> anyhow::Result<Vec<String>> {
+    let goals: Vec<(String,)> =
+        sqlx::query_as("SELECT title FROM goals WHERE user_id = ? AND status = 'active'")
+            .bind(user_id)
+            .fetch_all(db)
+            .await?;
+    Ok(goals.into_iter().map(|(title,)| title).collect())
 }
 
 // ── Default reminders for new users ──
@@ -500,7 +656,7 @@ pub async fn setup_default_reminders(db: &SqlitePool, user_id: i64) -> anyhow::R
     // Daily mood check-in at 9am UTC (user can adjust timezone later)
     // cron crate uses 7-field format: sec min hour day month weekday year
     let checkin_id = Uuid::new_v4().to_string();
-    let checkin_next = crate::scheduler::compute_next_run("cron", "0 0 9 * * * *", now);
+    let checkin_next = crate::scheduler::compute_next_run("cron", "0 0 9 * * * *", now, "UTC");
 
     sqlx::query(
         r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
@@ -514,7 +670,7 @@ pub async fn setup_default_reminders(db: &SqlitePool, user_id: i64) -> anyhow::R
 
     // Evening goal nudge at 7pm UTC
     let nudge_id = Uuid::new_v4().to_string();
-    let nudge_next = crate::scheduler::compute_next_run("cron", "0 0 19 * * * *", now);
+    let nudge_next = crate::scheduler::compute_next_run("cron", "0 0 19 * * * *", now, "UTC");
 
     sqlx::query(
         r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
@@ -528,7 +684,7 @@ pub async fn setup_default_reminders(db: &SqlitePool, user_id: i64) -> anyhow::R
 
     // Weekly review on Sunday at 6pm UTC
     let review_id = Uuid::new_v4().to_string();
-    let review_next = crate::scheduler::compute_next_run("cron", "0 0 18 * * SUN *", now);
+    let review_next = crate::scheduler::compute_next_run("cron", "0 0 18 * * SUN *", now, "UTC");
 
     sqlx::query(
         r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
@@ -568,6 +724,7 @@ async fn save_chat_message(
 
 async fn transcribe_voice(file_id: &str) -> anyhow::Result<String> {
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")?;
+    let started_at = Instant::now();
 
     // Get file path from Telegram
     #[derive(Deserialize)]
@@ -580,6 +737,7 @@ async fn transcribe_voice(file_id: &str) -> anyhow::Result<String> {
         file_path: Option<String>,
     }
 
+    let get_file_started_at = Instant::now();
     let resp: GetFileResponse = reqwest::Client::new()
         .get(format!(
             "https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
@@ -588,6 +746,7 @@ async fn transcribe_voice(file_id: &str) -> anyhow::Result<String> {
         .await?
         .json()
         .await?;
+    let get_file_ms = get_file_started_at.elapsed().as_millis() as u64;
 
     let file_path = resp
         .result
@@ -595,6 +754,7 @@ async fn transcribe_voice(file_id: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Telegram getFile returned no file_path"))?;
 
     // Download the file
+    let download_started_at = Instant::now();
     let file_bytes = reqwest::Client::new()
         .get(format!(
             "https://api.telegram.org/file/bot{bot_token}/{file_path}"
@@ -604,10 +764,25 @@ async fn transcribe_voice(file_id: &str) -> anyhow::Result<String> {
         .bytes()
         .await?
         .to_vec();
+    let download_ms = download_started_at.elapsed().as_millis() as u64;
 
     // Transcribe with Whisper
     let filename = file_path.rsplit('/').next().unwrap_or("voice.ogg");
-    openai::transcribe(file_bytes, filename).await
+    let file_size_bytes = file_bytes.len();
+    let transcription_started_at = Instant::now();
+    let transcript = openai::transcribe(file_bytes, filename).await?;
+    let transcription_ms = transcription_started_at.elapsed().as_millis() as u64;
+    tracing::info!(
+        file_id,
+        filename,
+        file_size_bytes,
+        get_file_ms,
+        download_ms,
+        transcription_ms,
+        total_ms = started_at.elapsed().as_millis() as u64,
+        "telegram voice transcription timing"
+    );
+    Ok(transcript)
 }
 
 // ── Telegram API helpers ──
@@ -683,7 +858,7 @@ async fn handle_goals_command(db: SqlitePool, chat_id: i64, user_id: i64) -> any
     .await?;
 
     let text = if goals.is_empty() {
-        "You don't have any active goals yet.\n\n🎯 Tell me a goal you'd like to work on, or tap below to add one in the app.".to_string()
+        "You don't have any active goals yet.\n\n🎯 Tell me a goal you'd like to work on here in chat, then use the mini app to log progress and review your ikigai map.".to_string()
     } else {
         let list: Vec<String> = goals
             .iter()
@@ -691,14 +866,13 @@ async fn handle_goals_command(db: SqlitePool, chat_id: i64, user_id: i64) -> any
             .map(|(i, (title, _))| format!("{}. {}", i + 1, title))
             .collect();
         format!(
-            "🎯 Your active goals:\n\n{}\n\nTell me about your progress, or tap below to see details.",
+            "🎯 Your active goals:\n\n{}\n\nTell me about your progress here, or tap below to open the progress dashboard.",
             list.join("\n")
         )
     };
 
     let miniapp_url = std::env::var("MINIAPP_URL").ok().filter(|s| !s.is_empty());
-    let reply_markup =
-        miniapp_url.map(|url| ReplyMarkup::web_app_button("View Goals", &format!("{url}goals")));
+    let reply_markup = miniapp_url.map(|url| ReplyMarkup::web_app_button("Open Progress", &url));
 
     // Send with optional button
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")?;

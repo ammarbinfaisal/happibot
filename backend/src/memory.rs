@@ -1,8 +1,43 @@
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::openai;
+
+fn signal_word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+        .count()
+}
+
+fn has_numeric_signal(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_ascii_digit())
+}
+
+pub fn should_use_semantic_search(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let chars = trimmed.chars().count();
+    let words = signal_word_count(trimmed);
+
+    has_numeric_signal(trimmed) || (chars >= 32 && words >= 6)
+}
+
+fn should_store_turn_for_memory(user_text: &str) -> bool {
+    let trimmed = user_text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let chars = trimmed.chars().count();
+    let words = signal_word_count(trimmed);
+
+    has_numeric_signal(trimmed) || (chars >= 28 && words >= 5)
+}
 
 // ── Embedding helpers ──
 
@@ -162,15 +197,37 @@ pub async fn post_message_pipeline(
     reply: &str,
     goal_titles: &[String],
 ) {
+    let started_at = Instant::now();
+    if !should_store_turn_for_memory(user_text) {
+        tracing::debug!(user_id, "skipping low-signal memory pipeline");
+        return;
+    }
+
     // 1. Embed the conversation turn
+    let embed_turn_started_at = Instant::now();
     if let Err(e) = embed_chat_turn(db, user_id, user_msg_id, user_text, reply).await {
         tracing::error!(user_id, ?e, "failed to embed chat turn");
     }
+    let embed_turn_ms = embed_turn_started_at.elapsed().as_millis() as u64;
 
     // 2. Maybe generate observations (every 4th message or if substantive)
+    let observations_started_at = Instant::now();
     if let Err(e) = maybe_generate_observations(db, user_id, goal_titles).await {
         tracing::error!(user_id, ?e, "failed to generate observations");
     }
+    let maybe_generate_observations_ms = observations_started_at.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        user_id,
+        user_msg_id,
+        goal_count = goal_titles.len(),
+        user_text_chars = user_text.chars().count(),
+        reply_chars = reply.chars().count(),
+        embed_turn_ms,
+        maybe_generate_observations_ms,
+        total_ms = started_at.elapsed().as_millis() as u64,
+        "memory pipeline timing"
+    );
 }
 
 async fn embed_chat_turn(
@@ -227,6 +284,12 @@ async fn maybe_generate_observations(
 
     let interval = crate::config::observation_interval();
     if msg_count.0 < interval {
+        tracing::debug!(
+            user_id,
+            messages_since_last_observation = msg_count.0,
+            observation_interval = interval,
+            "skipping observation generation"
+        );
         return Ok(());
     }
 
@@ -358,4 +421,39 @@ pub async fn load_observation_history(
 
     chain.reverse();
     Ok(chain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_store_turn_for_memory, should_use_semantic_search};
+
+    #[test]
+    fn semantic_search_skips_short_low_signal_messages() {
+        assert!(!should_use_semantic_search("hellow"));
+        assert!(!should_use_semantic_search("can i add a goal?"));
+    }
+
+    #[test]
+    fn semantic_search_runs_for_substantive_messages() {
+        assert!(should_use_semantic_search(
+            "I keep missing my workout plan whenever I sleep late and feel drained the next day."
+        ));
+        assert!(should_use_semantic_search("happiness 7 energy 4 stress 6"));
+    }
+
+    #[test]
+    fn memory_storage_skips_low_signal_turns() {
+        assert!(!should_store_turn_for_memory("ok"));
+        assert!(!should_store_turn_for_memory("can i add a goal?"));
+    }
+
+    #[test]
+    fn memory_storage_keeps_substantive_turns() {
+        assert!(should_store_turn_for_memory(
+            "I finished my run today and felt noticeably calmer afterward."
+        ));
+        assert!(should_store_turn_for_memory(
+            "stress 8 energy 3 happiness 4"
+        ));
+    }
 }

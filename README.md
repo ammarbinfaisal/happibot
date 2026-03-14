@@ -36,6 +36,10 @@ docker build -t happi-backend ./backend
 docker run --rm -p 8580:8080 -e TELEGRAM_BOT_TOKEN=... happi-backend
 ```
 
+The backend Docker build caches Cargo registry downloads and precompiled
+dependencies. If `backend/Cargo.toml` and `backend/Cargo.lock` do not change,
+later builds should reuse those layers instead of downloading Rust crates again.
+
 ### Local auth
 
 The backend accepts either:
