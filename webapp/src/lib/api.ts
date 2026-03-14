@@ -99,7 +99,7 @@ export type DashboardData = {
 };
 
 function apiBaseUrl() {
-  return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
+  return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8580";
 }
 
 function devUserId(): string | undefined {
