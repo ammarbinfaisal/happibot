@@ -18,10 +18,6 @@ function todayISO() {
 
 type DraftMap = Record<string, string>;
 
-function defaultValue(goal: GoalWithProgress) {
-  return goal.latest_value == null ? "" : String(goal.latest_value);
-}
-
 export default function TodayClient() {
   const initData = useRawInitData();
   const [loading, setLoading] = useState(true);
@@ -29,7 +25,6 @@ export default function TodayClient() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [noteDrafts, setNoteDrafts] = useState<DraftMap>({});
-  const [valueDrafts, setValueDrafts] = useState<DraftMap>({});
   const [savingGoalId, setSavingGoalId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -48,13 +43,6 @@ export default function TodayClient() {
           const next = { ...current };
           for (const goal of nextDashboard.goals) {
             next[goal.id] = next[goal.id] ?? "";
-          }
-          return next;
-        });
-        setValueDrafts((current) => {
-          const next = { ...current };
-          for (const goal of nextDashboard.goals) {
-            next[goal.id] = next[goal.id] ?? defaultValue(goal);
           }
           return next;
         });
@@ -78,24 +66,13 @@ export default function TodayClient() {
     const nextDashboard = await apiFetch<DashboardData>(initData, "/v1/dashboard");
     startTransition(() => {
       setDashboard(nextDashboard);
-      setValueDrafts((current) => {
-        const next = { ...current };
-        for (const goal of nextDashboard.goals) {
-          next[goal.id] = defaultValue(goal);
-        }
-        return next;
-      });
     });
   }
 
   async function submitProgress(goal: GoalWithProgress) {
     const rawNote = noteDrafts[goal.id]?.trim() ?? "";
-    const rawValue = valueDrafts[goal.id]?.trim() ?? "";
-    const parsedValue = rawValue ? Number(rawValue) : null;
-
-    if (!rawNote && !rawValue) return;
-    if (rawValue && Number.isNaN(parsedValue)) {
-      setSubmitError(`Progress value for "${goal.title}" must be a number.`);
+    if (!rawNote) {
+      setSubmitError(`Add a short update for "${goal.title}".`);
       return;
     }
 
@@ -108,10 +85,10 @@ export default function TodayClient() {
         body: JSON.stringify({
           goal_id: goal.id,
           date: todayISO(),
-          value: parsedValue,
+          value: null,
           note: rawNote || null,
           confidence: 4,
-          idempotency_key: `${goal.id}:${todayISO()}:${rawValue}:${rawNote}`,
+          idempotency_key: `${goal.id}:${todayISO()}:${rawNote}`,
         }),
       });
 
@@ -169,41 +146,21 @@ export default function TodayClient() {
                   ) : null}
                 </div>
 
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_104px]">
-                  <label className="progress-field">
-                    <span className="progress-field-label">Update</span>
-                    <textarea
-                      className="progress-textarea"
-                      rows={3}
-                      placeholder="What moved forward?"
-                      value={noteDrafts[goal.id] ?? ""}
-                      onChange={(event) =>
-                        setNoteDrafts((current) => ({
-                          ...current,
-                          [goal.id]: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-
-                  <label className="progress-field">
-                    <span className="progress-field-label">
-                      {goal.metric || goal.target_text || "Value"}
-                    </span>
-                    <input
-                      className="progress-input"
-                      inputMode="decimal"
-                      placeholder="Optional"
-                      value={valueDrafts[goal.id] ?? ""}
-                      onChange={(event) =>
-                        setValueDrafts((current) => ({
-                          ...current,
-                          [goal.id]: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                </div>
+                <label className="progress-field">
+                  <span className="progress-field-label">Update</span>
+                  <textarea
+                    className="progress-textarea"
+                    rows={3}
+                    placeholder="What moved forward today?"
+                    value={noteDrafts[goal.id] ?? ""}
+                    onChange={(event) =>
+                      setNoteDrafts((current) => ({
+                        ...current,
+                        [goal.id]: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
 
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
@@ -216,7 +173,7 @@ export default function TodayClient() {
                   <Button
                     size="m"
                     onClick={() => submitProgress(goal)}
-                    disabled={savingGoalId === goal.id}
+                    disabled={savingGoalId === goal.id || !(noteDrafts[goal.id] ?? "").trim()}
                   >
                     {savingGoalId === goal.id ? "Saving..." : "Save"}
                   </Button>

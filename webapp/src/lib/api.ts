@@ -83,6 +83,13 @@ export type GoalAlignmentEntry = {
   quadrants: string[];
 };
 
+export type ForcedIkigaiSnapshot = {
+  ikigai: IkigaiProfile;
+  goal_alignments: GoalAlignmentEntry[];
+  ikigai_svg: string;
+  generated_at: string;
+};
+
 export type StreakInfo = {
   current_mood_streak: number;
   current_progress_streak: number;
@@ -143,4 +150,10 @@ export async function apiFetch<T>(
   const contentType = res.headers.get("content-type") || "";
   if (contentType.includes("application/json")) return (await res.json()) as T;
   return (await res.text()) as T;
+}
+
+export function forceGenerateIkigai(initData: string | undefined) {
+  return apiFetch<ForcedIkigaiSnapshot>(initData, "/v1/ikigai/force", {
+    method: "POST",
+  });
 }
