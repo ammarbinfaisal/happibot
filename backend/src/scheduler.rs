@@ -91,7 +91,11 @@ async fn process_one_reminder(
     let goal_list = if goals.is_empty() {
         String::new()
     } else {
-        let items: Vec<String> = goals.iter().enumerate().map(|(i, g)| format!("{}. {}", i + 1, g.title)).collect();
+        let items: Vec<String> = goals
+            .iter()
+            .enumerate()
+            .map(|(i, g)| format!("{}. {}", i + 1, g.title))
+            .collect();
         format!("\n\nYour active goals:\n{}", items.join("\n"))
     };
 
@@ -190,7 +194,10 @@ pub fn compute_next_run(
             sched.after(&after).next()
         }
         _ => {
-            tracing::warn!(schedule_kind, "unsupported schedule_kind, cannot compute next_run");
+            tracing::warn!(
+                schedule_kind,
+                "unsupported schedule_kind, cannot compute next_run"
+            );
             None
         }
     }

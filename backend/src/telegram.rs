@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,10 @@ pub async fn telegram_webhook(
     headers: HeaderMap,
     Json(update): Json<Update>,
 ) -> impl IntoResponse {
-    if let Some(expected) = std::env::var("WEBHOOK_SECRET_TOKEN").ok().filter(|s| !s.is_empty()) {
+    if let Some(expected) = std::env::var("WEBHOOK_SECRET_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         let actual = headers
             .get("x-telegram-bot-api-secret-token")
             .and_then(|v| v.to_str().ok());
@@ -121,10 +124,34 @@ pub async fn telegram_webhook(
         };
         let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
 
-        // /start command
-        if msg.text.as_deref().map(|t| t.starts_with("/start")).unwrap_or(false) {
-            let resp = handle_start();
-            return Json(resp.with_chat_id(chat_id)).into_response();
+        // Bot commands
+        if let Some(text) = msg.text.as_deref() {
+            let cmd = text.split_whitespace().next().unwrap_or("");
+            match cmd {
+                "/start" => {
+                    let resp = handle_start();
+                    return Json(resp.with_chat_id(chat_id)).into_response();
+                }
+                "/app" => {
+                    let resp = handle_app_command();
+                    return Json(resp.with_chat_id(chat_id)).into_response();
+                }
+                "/goals" => {
+                    let db = st.db.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_goals_command(db, chat_id, user_id).await {
+                            tracing::error!(chat_id, ?e, "failed /goals");
+                            let _ = send_telegram_message(chat_id, "Something went wrong.").await;
+                        }
+                    });
+                    return (StatusCode::OK, "ok").into_response();
+                }
+                "/checkin" => {
+                    let resp = handle_checkin_command();
+                    return Json(resp.with_chat_id(chat_id)).into_response();
+                }
+                _ => {} // fall through to handle_user_message
+            }
         }
 
         // Process text or voice in background so we reply fast to Telegram
@@ -132,7 +159,8 @@ pub async fn telegram_webhook(
         tokio::spawn(async move {
             if let Err(e) = handle_user_message(db, chat_id, user_id, msg).await {
                 tracing::error!(chat_id, ?e, "failed to handle user message");
-                let _ = send_telegram_message(chat_id, "Sorry, something went wrong. Try again?").await;
+                let _ =
+                    send_telegram_message(chat_id, "Sorry, something went wrong. Try again?").await;
             }
         });
     }
@@ -149,10 +177,18 @@ async fn handle_user_message(
     msg: Message,
 ) -> anyhow::Result<()> {
     // Ensure user exists
-    sqlx::query("INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING")
-        .bind(user_id)
-        .execute(&db)
-        .await?;
+    let result =
+        sqlx::query("INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING")
+            .bind(user_id)
+            .execute(&db)
+            .await?;
+
+    // New user: set up default reminders
+    if result.rows_affected() > 0 {
+        if let Err(e) = setup_default_reminders(&db, user_id).await {
+            tracing::error!(user_id, ?e, "failed to set up default reminders");
+        }
+    }
 
     // Get the text: either from text field or transcribe voice
     let user_text = if let Some(voice) = msg.voice {
@@ -178,27 +214,77 @@ async fn handle_user_message(
     // Send typing indicator
     let _ = send_telegram_action(chat_id, "typing").await;
 
-    // Load recent chat history (last 10 messages for context)
+    // Load recent chat history for direct context
+    let history_window = crate::config::chat_history_window();
     let history: Vec<(String, String)> = sqlx::query_as(
-        "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+        "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
     )
     .bind(user_id)
+    .bind(history_window)
     .fetch_all(&db)
     .await?
     .into_iter()
     .rev()
     .collect();
 
-    // Load active goals for context
-    let goals: Vec<(String,)> =
-        sqlx::query_as("SELECT title FROM goals WHERE user_id = ? AND status = 'active'")
-            .bind(user_id)
-            .fetch_all(&db)
-            .await?;
-    let goal_titles: Vec<String> = goals.into_iter().map(|(t,)| t).collect();
+    // Load active goals with richer context for the LLM
+    let goals: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, why, cadence, deadline FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&db)
+    .await?;
+    let goal_titles: Vec<String> = goals
+        .iter()
+        .map(|(title, why, cadence, deadline)| {
+            let mut s = title.clone();
+            if let Some(w) = why {
+                s.push_str(&format!(" (why: {w})"));
+            }
+            if let Some(c) = cadence {
+                s.push_str(&format!(" [{c}]"));
+            }
+            if let Some(d) = deadline {
+                s.push_str(&format!(" due:{d}"));
+            }
+            s
+        })
+        .collect();
 
-    // Parse intent via LLM
-    let intent = openai::parse_intent(&user_text, &history, &goal_titles).await?;
+    // Load memory context: observations + semantic search
+    let observations = crate::memory::load_active_observations(&db, user_id)
+        .await
+        .unwrap_or_default();
+
+    // Embed the user message and search for relevant past context
+    let retrieved_context = match openai::embed(&[&user_text]).await {
+        Ok(embs) if !embs.is_empty() => {
+            let top_k = crate::config::semantic_search_top_k();
+            let results = crate::memory::search_similar(
+                &db,
+                user_id,
+                &embs[0],
+                &["chat", "observation"],
+                top_k,
+            )
+            .await
+            .unwrap_or_default();
+            crate::memory::load_chat_content(&db, &results)
+                .await
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Parse intent with full memory context
+    let intent = openai::parse_intent_with_memory(
+        &user_text,
+        &history,
+        &goal_titles,
+        &observations,
+        &retrieved_context,
+    )
+    .await?;
     tracing::info!(chat_id, ?intent, "parsed intent");
 
     let reply = match intent {
@@ -207,9 +293,7 @@ async fn handle_user_message(
             energy,
             stress,
             note,
-        } => {
-            execute_mood(&db, user_id, happiness, energy, stress, note.as_deref()).await?
-        }
+        } => execute_mood(&db, user_id, happiness, energy, stress, note.as_deref()).await?,
         openai::ParsedIntent::Progress {
             goal_title,
             value,
@@ -221,11 +305,29 @@ async fn handle_user_message(
         openai::ParsedIntent::Chat { reply } => reply,
     };
 
-    // Store conversation in history
-    save_chat_message(&db, user_id, "user", &user_text).await?;
+    // Store conversation in history (returns the user message row ID)
+    let user_msg_id = save_chat_message(&db, user_id, "user", &user_text).await?;
     save_chat_message(&db, user_id, "assistant", &reply).await?;
 
     send_telegram_message(chat_id, &reply).await?;
+
+    // Async post-message pipeline: embed chat turn + generate observations
+    let db_clone = db.clone();
+    let reply_clone = reply.clone();
+    let user_text_clone = user_text.clone();
+    let goal_titles_clone = goal_titles.clone();
+    tokio::spawn(async move {
+        crate::memory::post_message_pipeline(
+            &db_clone,
+            user_id,
+            user_msg_id,
+            &user_text_clone,
+            &reply_clone,
+            &goal_titles_clone,
+        )
+        .await;
+    });
+
     Ok(())
 }
 
@@ -375,8 +477,71 @@ async fn execute_create_goal(
 
     Ok(format!(
         "🎯 Goal created: \"{title}\"{}You can log progress anytime by telling me about it!",
-        why.map(|w| format!("\nWhy: {w}\n")).unwrap_or_else(|| "\n".to_string())
+        why.map(|w| format!("\nWhy: {w}\n"))
+            .unwrap_or_else(|| "\n".to_string())
     ))
+}
+
+// ── Default reminders for new users ──
+
+pub async fn setup_default_reminders(db: &SqlitePool, user_id: i64) -> anyhow::Result<()> {
+    // Check if user already has reminders
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM reminders WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(db)
+        .await?;
+
+    if count.0 > 0 {
+        return Ok(()); // already set up
+    }
+
+    let now = Utc::now();
+
+    // Daily mood check-in at 9am UTC (user can adjust timezone later)
+    // cron crate uses 7-field format: sec min hour day month weekday year
+    let checkin_id = Uuid::new_v4().to_string();
+    let checkin_next = crate::scheduler::compute_next_run("cron", "0 0 9 * * * *", now);
+
+    sqlx::query(
+        r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
+           VALUES (?, ?, 'daily_checkin', 'cron', '0 0 9 * * * *', '{}', ?, 1)"#,
+    )
+    .bind(&checkin_id)
+    .bind(user_id)
+    .bind(checkin_next.map(|t| t.to_rfc3339()))
+    .execute(db)
+    .await?;
+
+    // Evening goal nudge at 7pm UTC
+    let nudge_id = Uuid::new_v4().to_string();
+    let nudge_next = crate::scheduler::compute_next_run("cron", "0 0 19 * * * *", now);
+
+    sqlx::query(
+        r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
+           VALUES (?, ?, 'goal_update', 'cron', '0 0 19 * * * *', '{}', ?, 1)"#,
+    )
+    .bind(&nudge_id)
+    .bind(user_id)
+    .bind(nudge_next.map(|t| t.to_rfc3339()))
+    .execute(db)
+    .await?;
+
+    // Weekly review on Sunday at 6pm UTC
+    let review_id = Uuid::new_v4().to_string();
+    let review_next = crate::scheduler::compute_next_run("cron", "0 0 18 * * SUN *", now);
+
+    sqlx::query(
+        r#"INSERT INTO reminders (id, user_id, type, schedule_kind, schedule, payload_json, next_run_at, enabled)
+           VALUES (?, ?, 'weekly_review', 'cron', '0 0 18 * * SUN *', '{}', ?, 1)"#,
+    )
+    .bind(&review_id)
+    .bind(user_id)
+    .bind(review_next.map(|t| t.to_rfc3339()))
+    .execute(db)
+    .await?;
+
+    tracing::info!(user_id, "set up default reminders");
+    Ok(())
 }
 
 // ── Chat history ──
@@ -386,24 +551,17 @@ async fn save_chat_message(
     user_id: i64,
     role: &str,
     content: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)")
+) -> anyhow::Result<i64> {
+    let result = sqlx::query("INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)")
         .bind(user_id)
         .bind(role)
         .bind(content)
         .execute(db)
         .await?;
 
-    // Keep only last 50 messages per user to avoid unbounded growth
-    sqlx::query(
-        "DELETE FROM chat_history WHERE user_id = ? AND id NOT IN (SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 50)",
-    )
-    .bind(user_id)
-    .bind(user_id)
-    .execute(db)
-    .await?;
+    // No longer cap at 50 — all messages are kept for semantic search via embeddings
 
-    Ok(())
+    Ok(result.last_insert_rowid())
 }
 
 // ── Voice transcription ──
@@ -493,7 +651,71 @@ async fn send_telegram_action(chat_id: i64, action: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-// ── /start handler ──
+// ── Command handlers ──
+
+fn handle_app_command() -> WebhookReply {
+    let miniapp_url = std::env::var("MINIAPP_URL").ok().filter(|s| !s.is_empty());
+    match miniapp_url {
+        Some(url) => WebhookReply {
+            text: "✨ Tap below to open Happi!".to_string(),
+            reply_markup: Some(ReplyMarkup::web_app_button("Open Happi", &url)),
+        },
+        None => WebhookReply {
+            text: "The mini app isn't configured yet.".to_string(),
+            reply_markup: None,
+        },
+    }
+}
+
+fn handle_checkin_command() -> WebhookReply {
+    WebhookReply {
+        text: "💭 How are you feeling right now?\n\nJust tell me in your own words — or send a voice message. I'll log your mood (happiness, energy, stress).".to_string(),
+        reply_markup: None,
+    }
+}
+
+async fn handle_goals_command(db: SqlitePool, chat_id: i64, user_id: i64) -> anyhow::Result<()> {
+    let goals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT title, status FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&db)
+    .await?;
+
+    let text = if goals.is_empty() {
+        "You don't have any active goals yet.\n\n🎯 Tell me a goal you'd like to work on, or tap below to add one in the app.".to_string()
+    } else {
+        let list: Vec<String> = goals
+            .iter()
+            .enumerate()
+            .map(|(i, (title, _))| format!("{}. {}", i + 1, title))
+            .collect();
+        format!(
+            "🎯 Your active goals:\n\n{}\n\nTell me about your progress, or tap below to see details.",
+            list.join("\n")
+        )
+    };
+
+    let miniapp_url = std::env::var("MINIAPP_URL").ok().filter(|s| !s.is_empty());
+    let reply_markup =
+        miniapp_url.map(|url| ReplyMarkup::web_app_button("View Goals", &format!("{url}goals")));
+
+    // Send with optional button
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")?;
+    let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
+    if let Some(markup) = reply_markup {
+        body["reply_markup"] = serde_json::to_value(markup)?;
+    }
+    reqwest::Client::new()
+        .post(format!(
+            "https://api.telegram.org/bot{bot_token}/sendMessage"
+        ))
+        .json(&body)
+        .send()
+        .await?;
+
+    Ok(())
+}
 
 fn handle_start() -> WebhookReply {
     let miniapp_url = std::env::var("MINIAPP_URL").ok().filter(|s| !s.is_empty());
@@ -536,7 +758,9 @@ impl WebhookReply {
 // ── Webhook reply types ──
 
 pub fn spawn_set_webhook_on_startup() {
-    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.is_empty());
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let hook_url = std::env::var("HOOK_URL").ok().filter(|s| !s.is_empty());
     if bot_token.is_none() || hook_url.is_none() {
         return;
@@ -544,7 +768,9 @@ pub fn spawn_set_webhook_on_startup() {
 
     let bot_token = bot_token.unwrap();
     let hook_url = hook_url.unwrap();
-    let secret_token = std::env::var("WEBHOOK_SECRET_TOKEN").ok().filter(|s| !s.is_empty());
+    let secret_token = std::env::var("WEBHOOK_SECRET_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     tokio::spawn(async move {
         if !hook_url.starts_with("https://") {
@@ -605,6 +831,28 @@ pub fn spawn_set_webhook_on_startup() {
             tracing::info!(description = %desc, "telegram webhook already set");
         } else {
             tracing::info!(description = %desc, "telegram webhook set");
+        }
+
+        // Register bot commands
+        let commands = serde_json::json!({
+            "commands": [
+                {"command": "start", "description": "Welcome & intro"},
+                {"command": "app", "description": "Open the Happi mini app"},
+                {"command": "goals", "description": "View your active goals"},
+                {"command": "checkin", "description": "Quick mood check-in"},
+            ]
+        });
+        let cmd_resp = reqwest::Client::new()
+            .post(format!(
+                "https://api.telegram.org/bot{bot_token}/setMyCommands"
+            ))
+            .json(&commands)
+            .send()
+            .await;
+        match cmd_resp {
+            Ok(r) if r.status().is_success() => tracing::info!("bot commands registered"),
+            Ok(r) => tracing::warn!(status = %r.status(), "setMyCommands failed"),
+            Err(e) => tracing::warn!(?e, "setMyCommands request failed"),
         }
     });
 }

@@ -1,9 +1,9 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -241,8 +241,7 @@ async fn create_goal(
     let id = Uuid::new_v4().to_string();
     let target_kind = body.target_kind.unwrap_or_else(|| "number".to_string());
     let tags = body.tags.clone().unwrap_or_default();
-    let tags_json = serde_json::to_string(&tags)
-        .map_err(|_| HttpError::bad_request("bad tags"))?;
+    let tags_json = serde_json::to_string(&tags).map_err(|_| HttpError::bad_request("bad tags"))?;
     let ikigai_alignment_json = match body.ikigai_alignment {
         Some(v) => Some(v.to_string()),
         None => None,
@@ -317,9 +316,9 @@ async fn update_goal(
     }
 
     let tags_json = match body.tags {
-        Some(tags) => Some(
-            serde_json::to_string(&tags).map_err(|_| HttpError::bad_request("bad tags"))?,
-        ),
+        Some(tags) => {
+            Some(serde_json::to_string(&tags).map_err(|_| HttpError::bad_request("bad tags"))?)
+        }
         None => None,
     };
 
@@ -340,7 +339,12 @@ async fn update_goal(
         WHERE id = ? AND user_id = ?
         "#,
     )
-    .bind(body.title.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
+    .bind(
+        body.title
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty()),
+    )
     // why tri-state (no change vs set null vs set value)
     .bind(body.why.is_some().then_some(1))
     .bind(body.why.as_ref().and_then(|v| v.as_deref()))
@@ -564,15 +568,17 @@ async fn schedule_reminder(
     }
 
     let id = Uuid::new_v4().to_string();
-    let payload_json = body.payload.unwrap_or_else(|| serde_json::json!({})).to_string();
+    let payload_json = body
+        .payload
+        .unwrap_or_else(|| serde_json::json!({}))
+        .to_string();
     let quiet_hours_json = body.quiet_hours.map(|v| v.to_string());
-    let schedule_kind = body
-        .schedule_kind
-        .unwrap_or_else(|| "rrule".to_string());
+    let schedule_kind = body.schedule_kind.unwrap_or_else(|| "rrule".to_string());
     let enabled = body.enabled.unwrap_or(true);
 
-    let next_run_at = crate::scheduler::compute_next_run(&schedule_kind, &body.schedule, Utc::now())
-        .map(|dt| dt.to_rfc3339());
+    let next_run_at =
+        crate::scheduler::compute_next_run(&schedule_kind, &body.schedule, Utc::now())
+            .map(|dt| dt.to_rfc3339());
 
     sqlx::query(
         r#"
@@ -676,7 +682,9 @@ async fn summarize_week(
 
     let now = Utc::now().date_naive();
     let iso = now.iso_week();
-    let week = q.week.unwrap_or_else(|| format!("{}-{:02}", iso.year(), iso.week()));
+    let week = q
+        .week
+        .unwrap_or_else(|| format!("{}-{:02}", iso.year(), iso.week()));
 
     // MVP: counts in last 7 days.
     let date_from = now - chrono::Duration::days(6);
@@ -935,13 +943,12 @@ async fn get_dashboard(
 
     // Ikigai profile
     let ikigai = {
-        let row: Option<(Option<String>, String)> = sqlx::query_as(
-            "SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(&st.db)
-        .await
-        .map_err(|_| HttpError::bad_request("db error"))?;
+        let row: Option<(Option<String>, String)> =
+            sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&st.db)
+                .await
+                .map_err(|_| HttpError::bad_request("db error"))?;
 
         row.map(|(mission, themes_json)| {
             let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
@@ -1012,17 +1019,8 @@ async fn get_dashboard(
     }))
 }
 
-async fn compute_streak(
-    db: &SqlitePool,
-    user_id: i64,
-    query: &str,
-    today: NaiveDate,
-) -> i64 {
-    let dates: Vec<(String,)> = match sqlx::query_as(query)
-        .bind(user_id)
-        .fetch_all(db)
-        .await
-    {
+async fn compute_streak(db: &SqlitePool, user_id: i64, query: &str, today: NaiveDate) -> i64 {
+    let dates: Vec<(String,)> = match sqlx::query_as(query).bind(user_id).fetch_all(db).await {
         Ok(d) => d,
         Err(_) => return 0,
     };
@@ -1100,13 +1098,12 @@ async fn get_ikigai(
     let user_id = user_id_from(&headers)?;
     ensure_user(&st.db, user_id).await?;
 
-    let row: Option<(Option<String>, String)> = sqlx::query_as(
-        "SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?",
-    )
-    .bind(user_id)
-    .fetch_optional(&st.db)
-    .await
-    .map_err(|_| HttpError::bad_request("db error"))?;
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&st.db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
 
     let profile = row.map(|(mission, themes_json)| {
         let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();

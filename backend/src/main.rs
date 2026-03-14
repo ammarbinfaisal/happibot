@@ -4,13 +4,14 @@ mod config;
 mod db;
 mod dotenv;
 mod http_error;
+mod memory;
 mod openai;
 mod scheduler;
 mod state;
 mod telegram;
 mod user_id;
 
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use state::AppState;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
@@ -47,7 +48,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/telegram/webhook", axum::routing::post(telegram::telegram_webhook))
+        .route(
+            "/telegram/webhook",
+            axum::routing::post(telegram::telegram_webhook),
+        )
         .nest("/v1", api::v1::router())
         .with_state(app_state)
         .layer(TraceLayer::new_for_http())

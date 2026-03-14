@@ -21,4 +21,3 @@ pub fn extract_user_id(headers: &HeaderMap, fallback_query: Option<i64>) -> Resu
         "missing x-user-id header (or user_id query param for testing)",
     ))
 }
-

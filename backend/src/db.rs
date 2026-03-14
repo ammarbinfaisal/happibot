@@ -1,4 +1,4 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
@@ -11,4 +11,3 @@ pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<SqlitePoo
 
     Ok(pool)
 }
-
