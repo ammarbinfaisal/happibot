@@ -76,6 +76,31 @@ pub struct User {
     pub username: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct OutreachGoalRow {
+    title: String,
+    why: Option<String>,
+    cadence: Option<String>,
+    deadline: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OutreachProgressRow {
+    title: String,
+    date: String,
+    note: Option<String>,
+    value: Option<f64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OutreachMoodRow {
+    date: String,
+    happiness: i64,
+    energy: i64,
+    stress: i64,
+    note: Option<String>,
+}
+
 // ── Webhook handler ──
 
 pub async fn telegram_webhook(
@@ -93,6 +118,31 @@ pub async fn telegram_webhook(
         if actual != Some(expected.as_str()) {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
+    }
+
+    // Stopped mode: bot stays online but sends a notice to every sender.
+    if crate::config::stopped_mode() {
+        let chat_id = update
+            .message
+            .as_ref()
+            .and_then(|m| m.chat.as_ref())
+            .map(|c| c.id)
+            .or_else(|| {
+                update
+                    .callback_query
+                    .as_ref()
+                    .and_then(|cb| cb.message.as_ref())
+                    .and_then(|m| m.chat.as_ref())
+                    .map(|c| c.id)
+            });
+        if let Some(chat_id) = chat_id {
+            let _ = send_telegram_message(
+                chat_id,
+                "@ammarbinfaisal stopped me. You can self-host if you need: https://github.com/ammarbinfaisal/happibot",
+            )
+            .await;
+        }
+        return (StatusCode::OK, "ok").into_response();
     }
 
     let update_id = update.update_id;
@@ -148,8 +198,13 @@ pub async fn telegram_webhook(
                     return (StatusCode::OK, "ok").into_response();
                 }
                 "/checkin" => {
-                    let resp = handle_checkin_command();
-                    return Json(resp.with_chat_id(chat_id)).into_response();
+                    let db = st.db.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_checkin_command(db, chat_id, user_id).await {
+                            tracing::error!(chat_id, ?e, "failed /checkin");
+                        }
+                    });
+                    return (StatusCode::OK, "ok").into_response();
                 }
                 _ => {} // fall through to handle_user_message
             }
@@ -180,7 +235,6 @@ async fn handle_user_message(
     let started_at = Instant::now();
     let mut reminder_setup_ms = None;
     let mut voice_transcription_ms = None;
-    let mut voice_echo_ms = None;
     let mut semantic_search_ms = None;
 
     // Ensure user exists
@@ -212,11 +266,6 @@ async fn handle_user_message(
         let transcript = transcribe_voice(&voice.file_id).await?;
         voice_transcription_ms = Some(transcription_started_at.elapsed().as_millis() as u64);
         tracing::info!(chat_id, transcript = %transcript, "voice transcribed");
-
-        // Let user know what we heard
-        let voice_echo_started_at = Instant::now();
-        send_telegram_message(chat_id, &format!("I heard: \"{transcript}\"")).await?;
-        voice_echo_ms = Some(voice_echo_started_at.elapsed().as_millis() as u64);
         transcript
     } else if let Some(text) = msg.text {
         text
@@ -346,6 +395,7 @@ async fn handle_user_message(
         }
         openai::ParsedIntent::Chat { reply } => reply,
     };
+    let reply = openai::sanitize_user_facing_reply(&reply);
     let execute_intent_ms = execute_intent_started_at.elapsed().as_millis() as u64;
 
     // Store conversation in history (returns the user message row ID)
@@ -375,7 +425,6 @@ async fn handle_user_message(
         user_upsert_ms,
         reminder_setup_ms,
         voice_transcription_ms,
-        voice_echo_ms,
         typing_indicator_ms,
         history_load_ms,
         goal_load_ms,
@@ -462,10 +511,7 @@ async fn execute_mood(
     };
 
     Ok(format!(
-        "{emoji} Mood logged! Happiness: {}/10, Energy: {}/10, Stress: {}/10.{}",
-        happiness.clamp(1, 10),
-        energy.clamp(1, 10),
-        stress.clamp(1, 10),
+        "{emoji} Mood logged. I captured how you're feeling today.{}",
         note.map(|n| format!("\nNote: {n}")).unwrap_or_default()
     ))
 }
@@ -517,8 +563,7 @@ async fn execute_progress(
     .await?;
 
     Ok(format!(
-        "✅ Progress logged for \"{goal_title}\"!{}{}",
-        value.map(|v| format!(" Value: {v}")).unwrap_or_default(),
+        "✅ Progress logged for \"{goal_title}\"!{}",
         note.map(|n| format!("\nNote: {n}")).unwrap_or_default()
     ))
 }
@@ -826,6 +871,103 @@ async fn send_telegram_action(chat_id: i64, action: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+pub async fn generate_outreach_for_user(
+    db: &SqlitePool,
+    user_id: i64,
+    trigger: &str,
+    payload_json: Option<&str>,
+) -> anyhow::Result<String> {
+    let goals: Vec<OutreachGoalRow> = sqlx::query_as(
+        r#"
+        SELECT title, why, cadence, deadline
+        FROM goals
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY updated_at DESC
+        LIMIT 6
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let recent_progress: Vec<OutreachProgressRow> = sqlx::query_as(
+        r#"
+        SELECT g.title, p.date, p.note, p.value
+        FROM progress_logs p
+        JOIN goals g ON g.id = p.goal_id
+        WHERE p.user_id = ?
+        ORDER BY p.date DESC, p.created_at DESC
+        LIMIT 5
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let recent_moods: Vec<OutreachMoodRow> = sqlx::query_as(
+        r#"
+        SELECT date, happiness, energy, stress, note
+        FROM mood_logs
+        WHERE user_id = ?
+        ORDER BY date DESC
+        LIMIT 5
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let observations = crate::memory::load_active_observations(db, user_id)
+        .await
+        .unwrap_or_default();
+
+    let ikigai: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await?;
+
+    let payload_hint = payload_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let snapshot = serde_json::json!({
+        "trigger": trigger,
+        "payload_hint": payload_hint,
+        "active_goals": goals.iter().map(|goal| serde_json::json!({
+            "title": goal.title,
+            "why": goal.why,
+            "cadence": goal.cadence,
+            "deadline": goal.deadline,
+        })).collect::<Vec<_>>(),
+        "recent_progress": recent_progress.iter().map(|entry| serde_json::json!({
+            "goal_title": entry.title,
+            "date": entry.date,
+            "note": entry.note,
+            "value": entry.value,
+        })).collect::<Vec<_>>(),
+        "recent_moods": recent_moods.iter().map(|entry| serde_json::json!({
+            "date": entry.date,
+            "happiness": entry.happiness,
+            "energy": entry.energy,
+            "stress": entry.stress,
+            "note": entry.note,
+        })).collect::<Vec<_>>(),
+        "observations": observations.iter().map(|(category, goal_title, content, created_at)| serde_json::json!({
+            "category": category,
+            "goal_title": goal_title,
+            "content": content,
+            "created_at": created_at,
+        })).collect::<Vec<_>>(),
+        "ikigai": ikigai.map(|(mission, themes_json)| serde_json::json!({
+            "mission": mission,
+            "themes": serde_json::from_str::<Vec<String>>(&themes_json).unwrap_or_default(),
+        })),
+    });
+
+    openai::generate_outreach_message(&snapshot).await
+}
+
 // ── Command handlers ──
 
 fn handle_app_command() -> WebhookReply {
@@ -842,11 +984,10 @@ fn handle_app_command() -> WebhookReply {
     }
 }
 
-fn handle_checkin_command() -> WebhookReply {
-    WebhookReply {
-        text: "💭 How are you feeling right now?\n\nJust tell me in your own words — or send a voice message. I'll log your mood (happiness, energy, stress).".to_string(),
-        reply_markup: None,
-    }
+async fn handle_checkin_command(db: SqlitePool, chat_id: i64, user_id: i64) -> anyhow::Result<()> {
+    let _ = send_telegram_action(chat_id, "typing").await;
+    let text = generate_outreach_for_user(&db, user_id, "manual_checkin", None).await?;
+    send_telegram_message(chat_id, &text).await
 }
 
 async fn handle_goals_command(db: SqlitePool, chat_id: i64, user_id: i64) -> anyhow::Result<()> {

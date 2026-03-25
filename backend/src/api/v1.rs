@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/checkins/due", get(get_due_checkins))
         .route("/reviews/weekly", get(summarize_week))
         .route("/dashboard", get(get_dashboard))
+        .route("/ikigai/force", post(force_ikigai_generation))
         .route("/ikigai", get(get_ikigai).post(save_ikigai))
 }
 
@@ -977,7 +978,7 @@ async fn get_due_checkins(
         out.push(DueCheckin {
             user_id,
             kind: "daily_checkin".to_string(),
-            question_hint: "Mood 1-10 + one sentence".to_string(),
+            question_hint: "Share how today feels in your own words".to_string(),
         });
     }
 
@@ -1109,6 +1110,14 @@ struct ProgressEntryRow {
 struct IkigaiProfile {
     mission: Option<String>,
     themes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ForcedIkigaiResponse {
+    ikigai: IkigaiProfile,
+    goal_alignments: Vec<GoalAlignmentEntry>,
+    ikigai_svg: String,
+    generated_at: String,
 }
 
 #[derive(Serialize)]
@@ -1275,6 +1284,185 @@ fn render_ikigai_svg(
     Some(svg)
 }
 
+#[derive(sqlx::FromRow)]
+struct GoalSnapshotRow {
+    id: String,
+    title: String,
+    why: Option<String>,
+    metric: Option<String>,
+    target_kind: String,
+    target_value: Option<f64>,
+    target_text: Option<String>,
+    deadline: Option<String>,
+    cadence: Option<String>,
+    tags_json: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct RecentChatRow {
+    role: String,
+    content: String,
+    created_at: String,
+}
+
+async fn load_cached_ikigai_profile(
+    db: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<IkigaiProfile>, HttpError> {
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(row.map(|(mission, themes_json)| {
+        let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
+        IkigaiProfile { mission, themes }
+    }))
+}
+
+async fn load_cached_goal_alignments(
+    db: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<GoalAlignmentEntry>, HttpError> {
+    let alignment_rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        r#"
+        SELECT ga.goal_id, ga.alignment_score, ga.quadrants_json, g.title
+        FROM goal_alignment ga
+        JOIN goals g ON g.id = ga.goal_id
+        WHERE ga.user_id = ? AND g.status = 'active'
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    Ok(alignment_rows
+        .into_iter()
+        .map(|(goal_id, score, quadrants_json, title)| {
+            let quadrants: Vec<String> = serde_json::from_str(&quadrants_json).unwrap_or_default();
+            GoalAlignmentEntry {
+                goal_id,
+                goal_title: title,
+                alignment_score: score,
+                quadrants,
+            }
+        })
+        .collect())
+}
+
+fn normalize_quadrants(quadrants: &[String]) -> Vec<String> {
+    let valid = ["passion", "mission", "profession", "vocation"];
+    let mut normalized = Vec::new();
+
+    for quadrant in quadrants {
+        let quadrant = quadrant.trim().to_ascii_lowercase();
+        if valid.contains(&quadrant.as_str()) && !normalized.contains(&quadrant) {
+            normalized.push(quadrant);
+        }
+    }
+
+    normalized
+}
+
+fn fallback_generated_themes(
+    goal_rows: &[GoalSnapshotRow],
+    cached_ikigai: Option<&IkigaiProfile>,
+) -> Vec<String> {
+    let mut themes = Vec::new();
+
+    if let Some(profile) = cached_ikigai {
+        for theme in &profile.themes {
+            let theme = theme.trim();
+            if !theme.is_empty() && !themes.iter().any(|existing| existing == theme) {
+                themes.push(theme.to_string());
+            }
+            if themes.len() >= 6 {
+                return themes;
+            }
+        }
+    }
+
+    for goal in goal_rows {
+        let tags: Vec<String> = serde_json::from_str(&goal.tags_json).unwrap_or_default();
+        for tag in tags {
+            let tag = tag.trim().to_string();
+            if !tag.is_empty() && !themes.contains(&tag) {
+                themes.push(tag);
+            }
+            if themes.len() >= 6 {
+                return themes;
+            }
+        }
+    }
+
+    for goal in goal_rows {
+        let title = truncate_label(&goal.title, 18);
+        if !themes.contains(&title) {
+            themes.push(title);
+        }
+        if themes.len() >= 6 {
+            break;
+        }
+    }
+
+    themes
+}
+
+async fn persist_generated_ikigai(
+    db: &SqlitePool,
+    user_id: i64,
+    profile: &IkigaiProfile,
+    goal_alignments: &[GoalAlignmentEntry],
+) -> Result<(), HttpError> {
+    let themes_json =
+        serde_json::to_string(&profile.themes).map_err(|_| HttpError::bad_request("bad themes"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO ikigai_profiles (user_id, mission, themes_json)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          mission = excluded.mission,
+          themes_json = excluded.themes_json,
+          updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        "#,
+    )
+    .bind(user_id)
+    .bind(profile.mission.as_deref())
+    .bind(&themes_json)
+    .execute(db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    for alignment in goal_alignments {
+        let quadrants_json = serde_json::to_string(&alignment.quadrants)
+            .map_err(|_| HttpError::bad_request("bad quadrants"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO goal_alignment (goal_id, user_id, alignment_score, quadrants_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(goal_id) DO UPDATE SET
+              alignment_score = excluded.alignment_score,
+              quadrants_json = excluded.quadrants_json,
+              updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            "#,
+        )
+        .bind(&alignment.goal_id)
+        .bind(user_id)
+        .bind(alignment.alignment_score)
+        .bind(&quadrants_json)
+        .execute(db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+    }
+
+    Ok(())
+}
+
 async fn get_dashboard(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1419,46 +1607,8 @@ async fn get_dashboard(
     let active_goals_count = goal_rows.len() as i64;
 
     // Ikigai profile
-    let ikigai = {
-        let row: Option<(Option<String>, String)> =
-            sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_optional(&st.db)
-                .await
-                .map_err(|_| HttpError::bad_request("db error"))?;
-
-        row.map(|(mission, themes_json)| {
-            let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
-            IkigaiProfile { mission, themes }
-        })
-    };
-
-    // Goal alignments
-    let alignment_rows: Vec<(String, i64, String, String)> = sqlx::query_as(
-        r#"
-        SELECT ga.goal_id, ga.alignment_score, ga.quadrants_json, g.title
-        FROM goal_alignment ga
-        JOIN goals g ON g.id = ga.goal_id
-        WHERE ga.user_id = ? AND g.status = 'active'
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(&st.db)
-    .await
-    .map_err(|_| HttpError::bad_request("db error"))?;
-
-    let goal_alignments: Vec<GoalAlignmentEntry> = alignment_rows
-        .into_iter()
-        .map(|(goal_id, score, quadrants_json, title)| {
-            let quadrants: Vec<String> = serde_json::from_str(&quadrants_json).unwrap_or_default();
-            GoalAlignmentEntry {
-                goal_id,
-                goal_title: title,
-                alignment_score: score,
-                quadrants,
-            }
-        })
-        .collect();
+    let ikigai = load_cached_ikigai_profile(&st.db, user_id).await?;
+    let goal_alignments = load_cached_goal_alignments(&st.db, user_id).await?;
     let ikigai_svg = render_ikigai_svg(ikigai.as_ref(), &goal_alignments);
 
     // Streaks
@@ -1577,19 +1727,7 @@ async fn get_ikigai(
     let user_id = user_id_from(&headers)?;
     ensure_user(&st.db, user_id).await?;
 
-    let row: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT mission, themes_json FROM ikigai_profiles WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(&st.db)
-            .await
-            .map_err(|_| HttpError::bad_request("db error"))?;
-
-    let profile = row.map(|(mission, themes_json)| {
-        let themes: Vec<String> = serde_json::from_str(&themes_json).unwrap_or_default();
-        IkigaiProfile { mission, themes }
-    });
-
-    Ok(Json(profile))
+    Ok(Json(load_cached_ikigai_profile(&st.db, user_id).await?))
 }
 
 #[derive(Deserialize)]
@@ -1627,6 +1765,394 @@ async fn save_ikigai(
     .map_err(|_| HttpError::bad_request("db error"))?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn force_ikigai_generation(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ForcedIkigaiResponse>, HttpError> {
+    let user_id = user_id_from(&headers)?;
+    ensure_user(&st.db, user_id).await?;
+
+    let user_profile: UserProfileRow = sqlx::query_as(
+        r#"
+        SELECT user_id, timezone, reminder_window_start, reminder_window_end,
+               quiet_hours_start, quiet_hours_end, onboarding_state
+        FROM users
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let reminder_preferences = load_reminder_preferences(&st.db, user_id).await?;
+    let cached_ikigai = load_cached_ikigai_profile(&st.db, user_id).await?;
+    let cached_goal_alignments = load_cached_goal_alignments(&st.db, user_id).await?;
+
+    let goal_rows: Vec<GoalSnapshotRow> = sqlx::query_as(
+        r#"
+        SELECT id, title, why, metric, target_kind, target_value, target_text,
+               deadline, cadence, tags_json
+        FROM goals
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let thirty_days_ago = (Utc::now().date_naive() - Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let mood_summary: (i64, Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*), AVG(happiness), AVG(energy), AVG(stress)
+        FROM mood_logs
+        WHERE user_id = ? AND date >= ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(&thirty_days_ago)
+    .fetch_one(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let latest_mood: Option<(String, i64, i64, i64, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT date, happiness, energy, stress, note
+        FROM mood_logs
+        WHERE user_id = ?
+        ORDER BY date DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let recent_moods: Vec<MoodPoint> = sqlx::query_as(
+        r#"
+        SELECT date, happiness, energy, stress, note
+        FROM mood_logs
+        WHERE user_id = ?
+        ORDER BY date DESC
+        LIMIT 7
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let observations: Vec<(String, Option<String>, String, f64, String)> = sqlx::query_as(
+        r#"
+        SELECT o.category, g.title, o.content, o.confidence, o.created_at
+        FROM observations o
+        LEFT JOIN goals g ON g.id = o.goal_id
+        WHERE o.user_id = ? AND o.superseded_by IS NULL
+        ORDER BY o.confidence DESC, o.updated_at DESC
+        LIMIT 15
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+
+    let mut recent_chat: Vec<RecentChatRow> = sqlx::query_as(
+        r#"
+        SELECT role, content, created_at
+        FROM chat_history
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 12
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&st.db)
+    .await
+    .map_err(|_| HttpError::bad_request("db error"))?;
+    recent_chat.reverse();
+
+    if goal_rows.is_empty()
+        && recent_chat.is_empty()
+        && observations.is_empty()
+        && mood_summary.0 == 0
+        && cached_ikigai.is_none()
+    {
+        return Err(HttpError::bad_request(
+            "not enough user data to generate ikigai yet",
+        ));
+    }
+
+    let mut goals_snapshot = Vec::with_capacity(goal_rows.len());
+    for goal in &goal_rows {
+        let tags: Vec<String> = serde_json::from_str(&goal.tags_json).unwrap_or_default();
+        let recent_progress: Vec<ProgressEntryRow> = sqlx::query_as(
+            r#"
+            SELECT date, value, note, confidence
+            FROM progress_logs
+            WHERE user_id = ? AND goal_id = ?
+            ORDER BY date DESC, created_at DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(user_id)
+        .bind(&goal.id)
+        .fetch_all(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+        let total_logs: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM progress_logs
+            WHERE user_id = ? AND goal_id = ?
+            "#,
+        )
+        .bind(user_id)
+        .bind(&goal.id)
+        .fetch_one(&st.db)
+        .await
+        .map_err(|_| HttpError::bad_request("db error"))?;
+
+        let latest_progress: Option<(String, Option<f64>, Option<String>, Option<i64>)> =
+            sqlx::query_as(
+                r#"
+                SELECT date, value, note, confidence
+                FROM progress_logs
+                WHERE user_id = ? AND goal_id = ?
+                ORDER BY date DESC, created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(user_id)
+            .bind(&goal.id)
+            .fetch_optional(&st.db)
+            .await
+            .map_err(|_| HttpError::bad_request("db error"))?;
+
+        let cached_alignment = cached_goal_alignments
+            .iter()
+            .find(|entry| entry.goal_id == goal.id);
+
+        goals_snapshot.push(serde_json::json!({
+            "goal_id": goal.id,
+            "title": goal.title,
+            "why": goal.why,
+            "metric": goal.metric,
+            "target_kind": goal.target_kind,
+            "target_value": goal.target_value,
+            "target_text": goal.target_text,
+            "deadline": goal.deadline,
+            "cadence": goal.cadence,
+            "tags": tags,
+            "progress": {
+                "total_logs": total_logs,
+                "latest_entry": latest_progress.as_ref().map(|(date, value, note, confidence)| serde_json::json!({
+                    "date": date,
+                    "value": value,
+                    "note": note.as_deref().map(|value| truncate_label(value, 160)),
+                    "confidence": confidence,
+                })),
+                "recent_entries": recent_progress
+                    .iter()
+                    .map(|entry| serde_json::json!({
+                        "date": entry.date,
+                        "value": entry.value,
+                        "note": entry.note.as_deref().map(|value| truncate_label(value, 160)),
+                        "confidence": entry.confidence,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+            "cached_alignment": cached_alignment.map(|entry| serde_json::json!({
+                "alignment_score": entry.alignment_score,
+                "quadrants": entry.quadrants,
+            })),
+        }));
+    }
+
+    let snapshot = serde_json::json!({
+        "generated_at": Utc::now().to_rfc3339(),
+        "user_profile": {
+            "timezone": user_profile.timezone,
+            "onboarding_state": user_profile.onboarding_state,
+            "reminder_window_start": user_profile.reminder_window_start,
+            "reminder_window_end": user_profile.reminder_window_end,
+            "quiet_hours_start": user_profile.quiet_hours_start,
+            "quiet_hours_end": user_profile.quiet_hours_end,
+        },
+        "reminder_preferences": reminder_preferences,
+        "active_goals": goals_snapshot,
+        "mood": {
+            "last_30_days": {
+                "entries": mood_summary.0,
+                "avg_happiness": mood_summary.1,
+                "avg_energy": mood_summary.2,
+                "avg_stress": mood_summary.3,
+            },
+            "latest_entry": latest_mood.as_ref().map(|(date, happiness, energy, stress, note)| serde_json::json!({
+                "date": date,
+                "happiness": happiness,
+                "energy": energy,
+                "stress": stress,
+                "note": note.as_deref().map(|value| truncate_label(value, 160)),
+            })),
+            "recent_entries": recent_moods
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "date": entry.date,
+                    "happiness": entry.happiness,
+                    "energy": entry.energy,
+                    "stress": entry.stress,
+                    "note": entry.note.as_deref().map(|value| truncate_label(value, 160)),
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "observations": observations
+            .iter()
+            .map(|(category, goal_title, content, confidence, created_at)| serde_json::json!({
+                "category": category,
+                "goal_title": goal_title,
+                "content": truncate_label(content, 220),
+                "confidence": confidence,
+                "created_at": created_at,
+            }))
+            .collect::<Vec<_>>(),
+        "recent_chat": recent_chat
+            .iter()
+            .map(|row| serde_json::json!({
+                "role": row.role,
+                "content": truncate_label(&row.content, 280),
+                "created_at": row.created_at,
+            }))
+            .collect::<Vec<_>>(),
+        "cached_ikigai": cached_ikigai.as_ref().map(|profile| serde_json::json!({
+            "mission": profile.mission,
+            "themes": profile.themes,
+        })),
+        "cached_goal_alignments": cached_goal_alignments
+            .iter()
+            .map(|entry| serde_json::json!({
+                "goal_id": entry.goal_id,
+                "goal_title": entry.goal_title,
+                "alignment_score": entry.alignment_score,
+                "quadrants": entry.quadrants,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let generated = crate::openai::generate_ikigai_snapshot(&snapshot)
+        .await
+        .map_err(|error| {
+            tracing::error!(user_id, ?error, "failed to force generate ikigai");
+            HttpError::internal("failed to generate ikigai from live user data")
+        })?;
+
+    let mut themes = Vec::new();
+    for theme in &generated.themes {
+        let theme = theme.trim();
+        if theme.is_empty() {
+            continue;
+        }
+
+        let normalized = theme.to_ascii_lowercase();
+        if themes
+            .iter()
+            .any(|existing: &String| existing.to_ascii_lowercase() == normalized)
+        {
+            continue;
+        }
+
+        themes.push(theme.to_string());
+        if themes.len() >= 6 {
+            break;
+        }
+    }
+
+    if themes.len() < 3 {
+        for theme in fallback_generated_themes(&goal_rows, cached_ikigai.as_ref()) {
+            let normalized = theme.to_ascii_lowercase();
+            if themes
+                .iter()
+                .any(|existing: &String| existing.to_ascii_lowercase() == normalized)
+            {
+                continue;
+            }
+            themes.push(theme);
+            if themes.len() >= 6 {
+                break;
+            }
+        }
+    }
+
+    let mission = generated.mission.trim().to_string();
+    let mission = if mission.is_empty() {
+        cached_ikigai
+            .as_ref()
+            .and_then(|profile| profile.mission.clone())
+            .unwrap_or_else(|| "Your current ikigai direction".to_string())
+    } else {
+        mission
+    };
+
+    let ikigai = IkigaiProfile {
+        mission: Some(mission),
+        themes,
+    };
+
+    let mut goal_alignments = Vec::with_capacity(goal_rows.len());
+    for goal in &goal_rows {
+        let generated_alignment = generated
+            .goals
+            .iter()
+            .find(|entry| entry.goal_id == goal.id);
+        let cached_alignment = cached_goal_alignments
+            .iter()
+            .find(|entry| entry.goal_id == goal.id);
+
+        let alignment_score = generated_alignment
+            .map(|entry| entry.alignment_score.clamp(1, 100))
+            .or_else(|| cached_alignment.map(|entry| entry.alignment_score))
+            .unwrap_or(50);
+
+        let quadrants = generated_alignment
+            .map(|entry| normalize_quadrants(&entry.quadrants))
+            .filter(|items| !items.is_empty())
+            .or_else(|| cached_alignment.map(|entry| normalize_quadrants(&entry.quadrants)))
+            .unwrap_or_default();
+
+        goal_alignments.push(GoalAlignmentEntry {
+            goal_id: goal.id.clone(),
+            goal_title: goal.title.clone(),
+            alignment_score,
+            quadrants,
+        });
+    }
+
+    goal_alignments.sort_by(|a, b| {
+        b.alignment_score
+            .cmp(&a.alignment_score)
+            .then_with(|| a.goal_title.cmp(&b.goal_title))
+    });
+
+    persist_generated_ikigai(&st.db, user_id, &ikigai, &goal_alignments).await?;
+
+    let ikigai_svg = render_ikigai_svg(Some(&ikigai), &goal_alignments)
+        .ok_or_else(|| HttpError::internal("failed to render ikigai svg"))?;
+
+    Ok(Json(ForcedIkigaiResponse {
+        ikigai,
+        goal_alignments,
+        ikigai_svg,
+        generated_at: Utc::now().to_rfc3339(),
+    }))
 }
 
 // ── Goal alignment ──

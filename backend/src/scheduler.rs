@@ -18,12 +18,6 @@ struct DueReminder {
     timezone: String,
 }
 
-#[derive(sqlx::FromRow)]
-struct GoalTitle {
-    title: String,
-    cadence: Option<String>,
-}
-
 pub fn spawn_reminder_loop(db: SqlitePool) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -81,32 +75,13 @@ async fn process_one_reminder(
         return Ok(());
     }
 
-    // Load user's active goals for context
-    let goals: Vec<GoalTitle> = sqlx::query_as(
-        "SELECT title, cadence FROM goals WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
+    let message = telegram::generate_outreach_for_user(
+        db,
+        reminder.user_id,
+        &reminder.r#type,
+        Some(&reminder.payload_json),
     )
-    .bind(reminder.user_id)
-    .fetch_all(db)
     .await?;
-
-    let goal_list = if goals.is_empty() {
-        String::new()
-    } else {
-        let items: Vec<String> = goals
-            .iter()
-            .enumerate()
-            .map(|(i, g)| match g.cadence.as_deref() {
-                Some(cadence) if !cadence.trim().is_empty() => {
-                    format!("{}. {} [{}]", i + 1, g.title, cadence)
-                }
-                _ => format!("{}. {}", i + 1, g.title),
-            })
-            .collect();
-        format!("\n\nYour active goals:\n{}", items.join("\n"))
-    };
-
-    // Build the message based on reminder type
-    let message = build_reminder_message(&reminder.r#type, &reminder.payload_json, &goal_list);
 
     // Send via Telegram (user_id == chat_id for private chats)
     telegram::send_telegram_message(reminder.user_id, &message).await?;
@@ -166,34 +141,6 @@ async fn process_one_reminder(
 
     Ok(())
 }
-
-fn build_reminder_message(reminder_type: &str, payload_json: &str, goal_list: &str) -> String {
-    match reminder_type {
-        "daily_checkin" => format!(
-            "Hey! How are you feeling today? \
-             Send me a quick mood update (happiness, energy, stress 1-10) \
-             or just tell me how your day is going.{goal_list}"
-        ),
-        "weekly_review" => format!(
-            "Time for your weekly review! \
-             How did your week go? Any wins, challenges, or reflections?{goal_list}"
-        ),
-        "goal_update" => format!(
-            "Quick check-in: how's progress on your goals? \
-             Share an update and I'll log it for you.{goal_list}"
-        ),
-        _ => {
-            // Custom: try to extract message from payload
-            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_json) {
-                if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
-                    return format!("{msg}{goal_list}");
-                }
-            }
-            format!("Time for your reminder!{goal_list}")
-        }
-    }
-}
-
 pub fn compute_next_run(
     schedule_kind: &str,
     schedule: &str,

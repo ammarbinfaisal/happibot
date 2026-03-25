@@ -4,12 +4,27 @@ use reqwest::multipart;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 fn api_key() -> Option<String> {
     std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+fn openai_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("OpenAI reqwest client should build")
+    })
 }
 
 // ── Whisper transcription ──
@@ -28,7 +43,7 @@ pub async fn transcribe(file_bytes: Vec<u8>, filename: &str) -> anyhow::Result<S
         .text("response_format", "text")
         .part("file", part);
 
-    let resp = reqwest::Client::new()
+    let resp = openai_client()
         .post("https://api.openai.com/v1/audio/transcriptions")
         .bearer_auth(&api_key)
         .multipart(form)
@@ -355,7 +370,7 @@ async fn create_structured_response(
         },
     };
 
-    let resp = reqwest::Client::new()
+    let resp = openai_client()
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(&api_key)
         .json(&req)
@@ -495,6 +510,45 @@ struct StructuredObservations {
     observations: Vec<StructuredObservation>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum IkigaiQuadrantSchema {
+    Passion,
+    Mission,
+    Profession,
+    Vocation,
+}
+
+impl IkigaiQuadrantSchema {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passion => "passion",
+            Self::Mission => "mission",
+            Self::Profession => "profession",
+            Self::Vocation => "vocation",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StructuredIkigaiGoal {
+    goal_id: String,
+    alignment_score: i64,
+    quadrants: Vec<IkigaiQuadrantSchema>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StructuredIkigaiSnapshot {
+    mission: String,
+    themes: Vec<String>,
+    goals: Vec<StructuredIkigaiGoal>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StructuredOutreachMessage {
+    message: String,
+}
+
 impl TryFrom<StructuredIntent> for ParsedIntent {
     type Error = anyhow::Error;
 
@@ -560,6 +614,8 @@ Increase the user's happiness by helping them choose, pursue, and sustain meanin
 - Ask one short clarifying question only when required information is missing or genuinely ambiguous.
 - Do not ask unnecessary follow-up questions when a reasonable inference is available from the supplied context.
 - Prefer the minimal useful response or action. Do not add extra steps, options, or internal process.
+- Do not ask the user for numeric ratings or progress values unless they explicitly choose to give numbers first.
+- Prefer inferring structured fields from the user's words or voice transcript over asking for measurements.
 </default_follow_through_policy>
 
 <decision_policy>
@@ -576,6 +632,7 @@ When deciding between logging and coaching:
 - If the user sounds stuck, lower the bar and guide them toward the smallest meaningful next step.
 - If the user has no clear goal but wants change, help them define a goal that is concrete and personally meaningful.
 - Do not force tracking when the user mainly needs reflection, encouragement, or a clarifying question.
+- For text or audio updates, infer what you can from the user's description before considering any follow-up question.
 - If required fields for `mood`, `progress`, `create_goal`, or `delete_goal` are missing, choose `chat` instead and put the one short clarifying question in `reply`.
 </decision_policy>
 
@@ -598,13 +655,17 @@ When deciding between logging and coaching:
 
 <mood_logging_rules>
 - Log mood only when the message is specific enough to infer happiness, energy, and stress with confidence.
-- If mood is vague, choose chat and ask one short clarifying question.
+- Prefer inference from natural-language descriptions like "drained", "wired", "calmer", or "overwhelmed" rather than asking for ratings.
+- If mood is vague, choose chat and ask one short clarifying question that invites a natural-language description, not ratings.
 </mood_logging_rules>
 
 <progress_rules>
 - Match the best goal from the supplied active goals when possible.
 - Acknowledge progress warmly and connect it to the larger goal or to the user's wellbeing.
 - If progress is qualitative, `value` may be null and the note should carry the detail.
+- If the user describes progress without a quantity, still log it as progress with `value = null` and capture the substance in `note`.
+- Never ask the user for a missing numeric progress value just to complete logging.
+- When you need clarification, ask what moved forward in words rather than requesting a number.
 </progress_rules>
 
 <goal_creation_rules>
@@ -629,6 +690,7 @@ When deciding between logging and coaching:
 - Do not output markdown or prose outside the JSON object.
 - For `chat`, `reply` must contain the user-facing message.
 - For `mood`, `progress`, `create_goal`, and `delete_goal`, `reply` must be null.
+- If you are unsure or a non-chat intent is missing required fields, return `intent: "chat"` with a short natural-language `reply`; never leave the user without something to read.
 </grounding_rules>
 "#;
 
@@ -668,6 +730,47 @@ fn parse_intent_candidate(candidate: &str) -> Option<ParsedIntent> {
     parse_intent_value(value)
 }
 
+fn strip_code_fences(content: &str) -> &str {
+    let unfenced = content
+        .strip_prefix("```json")
+        .or_else(|| content.strip_prefix("```"))
+        .unwrap_or(content);
+    unfenced.strip_suffix("```").unwrap_or(unfenced).trim()
+}
+
+fn looks_like_structured_payload(content: &str) -> bool {
+    let trimmed = strip_code_fences(content);
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_json_shell = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    let has_intent_markers = lower.contains("\"intent\"")
+        && (lower.contains("\"reply\"")
+            || lower.contains("\"goal_title\"")
+            || lower.contains("\"title\"")
+            || lower.contains("\"happiness\"")
+            || lower.contains("\"energy\"")
+            || lower.contains("\"stress\""));
+
+    has_json_shell || has_intent_markers
+}
+
+pub fn sanitize_user_facing_reply(reply: &str) -> String {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() || looks_like_structured_payload(trimmed) {
+        FALLBACK_REPLY.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn parse_intent_from_content(content: &str) -> ParsedIntent {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -677,11 +780,7 @@ fn parse_intent_from_content(content: &str) -> ParsedIntent {
     }
 
     // Strip markdown code fences if the model wraps JSON output.
-    let unfenced = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    let unfenced = unfenced.strip_suffix("```").unwrap_or(unfenced).trim();
+    let unfenced = strip_code_fences(trimmed);
 
     if let Some(parsed) = parse_intent_candidate(unfenced) {
         return parsed;
@@ -699,11 +798,7 @@ fn parse_intent_from_content(content: &str) -> ParsedIntent {
 
     // Final fallback: treat raw model text as a normal chat reply.
     ParsedIntent::Chat {
-        reply: if unfenced.is_empty() {
-            FALLBACK_REPLY.to_string()
-        } else {
-            unfenced.to_string()
-        },
+        reply: sanitize_user_facing_reply(unfenced),
     }
 }
 
@@ -728,7 +823,7 @@ pub async fn embed(texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
     let input_char_count = texts.iter().map(|text| text.chars().count()).sum::<usize>();
     let start = Instant::now();
 
-    let resp = reqwest::Client::new()
+    let resp = openai_client()
         .post("https://api.openai.com/v1/embeddings")
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
@@ -787,6 +882,20 @@ fn default_confidence() -> f64 {
     0.8
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeneratedIkigaiGoal {
+    pub goal_id: String,
+    pub alignment_score: i64,
+    pub quadrants: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeneratedIkigaiSnapshot {
+    pub mission: String,
+    pub themes: Vec<String>,
+    pub goals: Vec<GeneratedIkigaiGoal>,
+}
+
 const OBSERVATION_SYSTEM_PROMPT: &str = r#"<role>
 You are the memory system for Happi, a wellbeing coaching agent.
 </role>
@@ -820,6 +929,54 @@ Generate durable observations that make future coaching more helpful, more perso
 </quality_bar>
 "#;
 
+const IKIGAI_SYSTEM_PROMPT: &str = r#"<role>
+You synthesize a current ikigai snapshot for Happi from the user's live data.
+</role>
+
+<mission>
+Create a grounded, current ikigai profile that reflects the user's latest goals, behavior, mood patterns, observations, reminders, and recent conversation.
+</mission>
+
+<grounding_rules>
+- Use only the supplied snapshot data.
+- Use every snapshot section that contains meaningful signal.
+- Prefer current evidence over older cached ikigai text when they conflict.
+- Do not invent life facts, values, or motivations that are not supported by the snapshot.
+</grounding_rules>
+
+<output_rules>
+- `mission` must be a single concise sentence describing the user's current direction.
+- `themes` should be 3 to 6 short phrases, each at most a few words.
+- Return one `goals` entry for every active goal in the snapshot, using the exact `goal_id`.
+- `alignment_score` must be an integer from 1 to 100.
+- `quadrants` must contain 1 to 4 values chosen only from `passion`, `mission`, `profession`, and `vocation`.
+- If evidence is mixed, choose the best-supported quadrants rather than all four.
+- Return exactly the JSON object required by the schema, with no markdown or extra prose.
+</output_rules>
+"#;
+
+const OUTREACH_SYSTEM_PROMPT: &str = r#"<role>
+You write short user-facing outreach messages for Happi.
+</role>
+
+<mission>
+Generate a timely, contextual message for a reminder or manual check-in command using the supplied user snapshot.
+</mission>
+
+<message_rules>
+- Write one concise message, usually 1 to 3 sentences.
+- Use the trigger type and user context to decide the angle.
+- Ground the message in the active goals, recent mood patterns, recent progress, observations, or ikigai context when useful.
+- Sound warm, natural, and specific. Do not sound scripted.
+- Do not ask for numeric ratings, scores, values, or scales.
+- Ask the user to reply in their own words.
+- For progress nudges, ask what moved forward or what got in the way in words.
+- For mood or check-in nudges, invite a natural-language reflection about how things feel.
+- If context is sparse, still write a natural message without mentioning missing data.
+- Return exactly the JSON object required by the schema, with no markdown or extra prose.
+</message_rules>
+"#;
+
 fn observations_json_schema() -> Value {
     let mut schema = openai_json_schema_for::<StructuredObservations>();
     if let Some(observations) = schema.pointer_mut("/properties/observations") {
@@ -828,6 +985,26 @@ fn observations_json_schema() -> Value {
         }
     }
     schema
+}
+
+fn ikigai_json_schema() -> Value {
+    let mut schema = openai_json_schema_for::<StructuredIkigaiSnapshot>();
+    if let Some(themes) = schema.pointer_mut("/properties/themes") {
+        if let Some(map) = themes.as_object_mut() {
+            map.insert("minItems".to_string(), json!(3));
+            map.insert("maxItems".to_string(), json!(6));
+        }
+    }
+    if let Some(goals) = schema.pointer_mut("/properties/goals") {
+        if let Some(map) = goals.as_object_mut() {
+            map.insert("maxItems".to_string(), json!(12));
+        }
+    }
+    schema
+}
+
+fn outreach_json_schema() -> Value {
+    openai_json_schema_for::<StructuredOutreachMessage>()
 }
 
 fn parse_observations_from_content(content: &str) -> anyhow::Result<Vec<GeneratedObservation>> {
@@ -891,6 +1068,90 @@ fn parse_observations_from_content(content: &str) -> anyhow::Result<Vec<Generate
     anyhow::bail!("failed to parse structured observations payload: {content}")
 }
 
+fn parse_ikigai_from_content(content: &str) -> anyhow::Result<GeneratedIkigaiSnapshot> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty ikigai payload");
+    }
+
+    let unfenced = strip_code_fences(trimmed);
+
+    let parse_structured = |candidate: &str| -> Option<GeneratedIkigaiSnapshot> {
+        serde_json::from_str::<StructuredIkigaiSnapshot>(candidate)
+            .ok()
+            .map(|parsed| GeneratedIkigaiSnapshot {
+                mission: parsed.mission,
+                themes: parsed.themes,
+                goals: parsed
+                    .goals
+                    .into_iter()
+                    .map(|goal| GeneratedIkigaiGoal {
+                        goal_id: goal.goal_id,
+                        alignment_score: goal.alignment_score,
+                        quadrants: goal
+                            .quadrants
+                            .into_iter()
+                            .map(|quadrant| quadrant.as_str().to_string())
+                            .collect(),
+                    })
+                    .collect(),
+            })
+    };
+
+    if let Some(parsed) = parse_structured(unfenced) {
+        return Ok(parsed);
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<GeneratedIkigaiSnapshot>(unfenced) {
+        return Ok(parsed);
+    }
+
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if start < end {
+            let candidate = &unfenced[start..=end];
+            if let Some(parsed) = parse_structured(candidate) {
+                return Ok(parsed);
+            }
+            if let Ok(parsed) = serde_json::from_str::<GeneratedIkigaiSnapshot>(candidate) {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    anyhow::bail!("failed to parse structured ikigai payload: {content}")
+}
+
+fn parse_outreach_message_from_content(content: &str) -> anyhow::Result<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty outreach payload");
+    }
+
+    let unfenced = strip_code_fences(trimmed);
+
+    let parse_structured = |candidate: &str| -> Option<String> {
+        serde_json::from_str::<StructuredOutreachMessage>(candidate)
+            .ok()
+            .map(|parsed| parsed.message.trim().to_string())
+            .filter(|message| !message.is_empty())
+    };
+
+    if let Some(parsed) = parse_structured(unfenced) {
+        return Ok(parsed);
+    }
+
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if start < end {
+            let candidate = &unfenced[start..=end];
+            if let Some(parsed) = parse_structured(candidate) {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    anyhow::bail!("failed to parse outreach payload: {content}")
+}
+
 pub async fn generate_observations(
     recent_chat: &[(String, String)],
     existing_observations: &[(String, String, Option<String>, String)], // id, category, goal_id, content
@@ -919,24 +1180,89 @@ pub async fn generate_observations(
         chat_text.push_str(&format!("{role}: {content}\n"));
     }
 
-    let content = create_structured_response(
-        crate::config::observation_model(),
-        instructions,
-        vec![input_text_message(
-            "user",
-            format!(
-                "<recent_conversation>\n{}</recent_conversation>\n\nReturn the structured observations object.",
-                chat_text.trim()
-            ),
-        )],
-        crate::config::observation_reasoning_effort(),
-        crate::config::observation_verbosity(),
-        "happi_observations",
-        observations_json_schema(),
+    let content = match tokio::time::timeout(
+        Duration::from_millis(crate::config::observation_timeout_ms()),
+        create_structured_response(
+            crate::config::observation_model(),
+            instructions,
+            vec![input_text_message(
+                "user",
+                format!(
+                    "<recent_conversation>\n{}</recent_conversation>\n\nReturn the structured observations object.",
+                    chat_text.trim()
+                ),
+            )],
+            crate::config::observation_reasoning_effort(),
+            crate::config::observation_verbosity(),
+            "happi_observations",
+            observations_json_schema(),
+        ),
     )
-        .await?;
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = crate::config::observation_timeout_ms(),
+                "observation generation timed out"
+            );
+            return Ok(Vec::new());
+        }
+    };
 
     parse_observations_from_content(&content)
+}
+
+pub async fn generate_ikigai_snapshot(snapshot: &Value) -> anyhow::Result<GeneratedIkigaiSnapshot> {
+    let snapshot_json = serde_json::to_string_pretty(snapshot)?;
+
+    let content = tokio::time::timeout(
+        Duration::from_millis(crate::config::ikigai_timeout_ms()),
+        create_structured_response(
+            crate::config::ikigai_model(),
+            IKIGAI_SYSTEM_PROMPT.to_string(),
+            vec![input_text_message(
+                "user",
+                format!(
+                    "<live_user_snapshot>\n{snapshot_json}\n</live_user_snapshot>\n\nReturn the structured ikigai object."
+                ),
+            )],
+            crate::config::ikigai_reasoning_effort(),
+            crate::config::ikigai_verbosity(),
+            "happi_ikigai_snapshot",
+            ikigai_json_schema(),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ikigai generation timed out"))??;
+
+    parse_ikigai_from_content(&content)
+}
+
+pub async fn generate_outreach_message(snapshot: &Value) -> anyhow::Result<String> {
+    let snapshot_json = serde_json::to_string_pretty(snapshot)?;
+
+    let content = tokio::time::timeout(
+        Duration::from_millis(crate::config::chat_timeout_ms()),
+        create_structured_response(
+            crate::config::chat_model(),
+            OUTREACH_SYSTEM_PROMPT.to_string(),
+            vec![input_text_message(
+                "user",
+                format!(
+                    "<outreach_context>\n{snapshot_json}\n</outreach_context>\n\nReturn the structured outreach message."
+                ),
+            )],
+            crate::config::chat_reasoning_effort(),
+            crate::config::chat_verbosity(),
+            "happi_outreach_message",
+            outreach_json_schema(),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("outreach generation timed out"))??;
+
+    parse_outreach_message_from_content(&content)
 }
 
 // ── Intent parsing with memory context ──
@@ -987,16 +1313,31 @@ pub async fn parse_intent_with_memory(
 
     input.push(input_text_message("user", user_message.to_string()));
 
-    let content = create_structured_response(
-        crate::config::chat_model(),
-        instructions,
-        input,
-        crate::config::chat_reasoning_effort(),
-        crate::config::chat_verbosity(),
-        "happi_intent",
-        intent_json_schema(),
+    let content = match tokio::time::timeout(
+        Duration::from_millis(crate::config::chat_timeout_ms()),
+        create_structured_response(
+            crate::config::chat_model(),
+            instructions,
+            input,
+            crate::config::chat_reasoning_effort(),
+            crate::config::chat_verbosity(),
+            "happi_intent",
+            intent_json_schema(),
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = crate::config::chat_timeout_ms(),
+                "intent parsing timed out; falling back to default reply"
+            );
+            return Ok(ParsedIntent::Chat {
+                reply: FALLBACK_REPLY.to_string(),
+            });
+        }
+    };
 
     let parsed = parse_intent_from_content(&content);
     tracing::debug!(
@@ -1011,8 +1352,10 @@ pub async fn parse_intent_with_memory(
 mod tests {
     use super::{
         FALLBACK_REPLY, ParsedIntent, ResponseApiResponse, ToolCallLogEntry, extract_output_text,
-        history_message, intent_json_schema, observations_json_schema, parse_intent_from_content,
-        parse_observations_from_content, response_tool_call_entries,
+        history_message, ikigai_json_schema, intent_json_schema, observations_json_schema,
+        outreach_json_schema, parse_ikigai_from_content, parse_intent_from_content,
+        parse_observations_from_content, parse_outreach_message_from_content,
+        response_tool_call_entries, sanitize_user_facing_reply,
     };
 
     #[test]
@@ -1150,6 +1493,27 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_when_invalid_structured_payload_would_otherwise_leak() {
+        let parsed = parse_intent_from_content(
+            r#"{"cadence":null,"energy":null,"goal_title":null,"happiness":null,"intent":"progress","note":"Read 1 page of Crime and Punishment.","reply":null,"stress":null,"title":"Reading (Crime and Punishment)","value":null,"why":null}"#,
+        );
+        match parsed {
+            ParsedIntent::Chat { reply } => {
+                assert_eq!(reply, FALLBACK_REPLY);
+            }
+            _ => panic!("expected chat intent"),
+        }
+    }
+
+    #[test]
+    fn sanitizes_json_shaped_reply_text() {
+        let reply = sanitize_user_facing_reply(
+            r#"{"intent":"chat","reply":"This should never reach the user raw"}"#,
+        );
+        assert_eq!(reply, FALLBACK_REPLY);
+    }
+
+    #[test]
     fn extracts_output_text_from_responses_payload() {
         let payload = serde_json::json!({
             "output": [
@@ -1278,6 +1642,44 @@ mod tests {
     }
 
     #[test]
+    fn ikigai_schema_wraps_goal_entries_in_object() {
+        let schema = ikigai_json_schema();
+        assert_eq!(
+            schema
+                .get("type")
+                .and_then(|value: &serde_json::Value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/themes/minItems")
+                .and_then(|value: &serde_json::Value| value.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/goals/type")
+                .and_then(|value: &serde_json::Value| value.as_str()),
+            Some("array")
+        );
+    }
+
+    #[test]
+    fn outreach_schema_has_object_root() {
+        let schema = outreach_json_schema();
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/message/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+    }
+
+    #[test]
     fn parses_wrapped_observations_payload() {
         let observations = parse_observations_from_content(
             r#"{"observations":[{"category":"pattern","content":"Late workouts improve mood","goal_title":"Exercise","confidence":0.9,"supersedes":null}]}"#,
@@ -1309,5 +1711,28 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert!((observations[0].confidence - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parses_wrapped_ikigai_payload() {
+        let snapshot = parse_ikigai_from_content(
+            r#"{"mission":"Build a calmer, healthier routine that creates useful momentum.","themes":["energy stability","health","discipline"],"goals":[{"goal_id":"goal-1","alignment_score":82,"quadrants":["passion","mission"]}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.themes.len(), 3);
+        assert_eq!(snapshot.goals.len(), 1);
+        assert_eq!(snapshot.goals[0].goal_id, "goal-1");
+        assert_eq!(snapshot.goals[0].quadrants, vec!["passion", "mission"]);
+    }
+
+    #[test]
+    fn parses_structured_outreach_message() {
+        let message = parse_outreach_message_from_content(
+            r#"{"message":"How has today been feeling so far? Reply in your own words and I’ll turn it into a quick check-in."}"#,
+        )
+        .unwrap();
+
+        assert!(message.contains("Reply in your own words"));
     }
 }

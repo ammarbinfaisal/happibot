@@ -43,11 +43,11 @@ COPY --from=builder /build/backend /app/backend
 USER app
 
 ENV RUST_LOG=info
-ENV BIND_ADDR=0.0.0.0:8080
+ENV BIND_ADDR=0.0.0.0:8580
 # Use a writable volume location by default.
 ENV DATABASE_URL=sqlite:///data/happi.db?mode=rwc
 
-EXPOSE 8080
+EXPOSE 8580
 VOLUME ["/data"]
 
 CMD ["/app/backend"]

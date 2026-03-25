@@ -9,7 +9,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8580".to_string());
         let bind: SocketAddr = bind.parse()?;
 
         let database_url = std::env::var("DATABASE_URL")
@@ -30,12 +30,12 @@ impl Config {
 
 /// Model used for intent parsing + chat responses
 pub fn chat_model() -> String {
-    std::env::var("HAPPI_CHAT_MODEL").unwrap_or_else(|_| "gpt-5.4-pro".to_string())
+    std::env::var("HAPPI_CHAT_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string())
 }
 
 /// Model used for generating observations about the user
 pub fn observation_model() -> String {
-    std::env::var("HAPPI_OBSERVATION_MODEL").unwrap_or_else(|_| "gpt-5.4-pro".to_string())
+    std::env::var("HAPPI_OBSERVATION_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string())
 }
 
 /// Embedding model for semantic search
@@ -45,12 +45,12 @@ pub fn embedding_model() -> String {
 
 /// Reasoning effort for intent parsing + chat responses.
 pub fn chat_reasoning_effort() -> String {
-    std::env::var("HAPPI_CHAT_REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string())
+    std::env::var("HAPPI_CHAT_REASONING_EFFORT").unwrap_or_else(|_| "low".to_string())
 }
 
 /// Reasoning effort for observation generation.
 pub fn observation_reasoning_effort() -> String {
-    std::env::var("HAPPI_OBSERVATION_REASONING_EFFORT").unwrap_or_else(|_| "high".to_string())
+    std::env::var("HAPPI_OBSERVATION_REASONING_EFFORT").unwrap_or_else(|_| "low".to_string())
 }
 
 /// Verbosity for user-facing coaching responses.
@@ -61,6 +61,45 @@ pub fn chat_verbosity() -> String {
 /// Verbosity for structured observation outputs.
 pub fn observation_verbosity() -> String {
     std::env::var("HAPPI_OBSERVATION_VERBOSITY").unwrap_or_else(|_| "low".to_string())
+}
+
+/// Max time to wait for the critical-path intent response before falling back.
+pub fn chat_timeout_ms() -> u64 {
+    std::env::var("HAPPI_CHAT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15_000)
+}
+
+/// Max time to wait for background observation generation before skipping it.
+pub fn observation_timeout_ms() -> u64 {
+    std::env::var("HAPPI_OBSERVATION_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000)
+}
+
+/// Model used for forced ikigai generation.
+pub fn ikigai_model() -> String {
+    std::env::var("HAPPI_IKIGAI_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string())
+}
+
+/// Reasoning effort for ikigai generation.
+pub fn ikigai_reasoning_effort() -> String {
+    std::env::var("HAPPI_IKIGAI_REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string())
+}
+
+/// Verbosity for structured ikigai outputs.
+pub fn ikigai_verbosity() -> String {
+    std::env::var("HAPPI_IKIGAI_VERBOSITY").unwrap_or_else(|_| "low".to_string())
+}
+
+/// Max time to wait for forced ikigai generation.
+pub fn ikigai_timeout_ms() -> u64 {
+    std::env::var("HAPPI_IKIGAI_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25_000)
 }
 
 /// Number of recent chat messages to include as direct context
@@ -93,4 +132,12 @@ pub fn max_observations_in_context() -> i32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(15)
+}
+
+/// When true the bot stays online but rejects all messages with a "stopped" notice.
+pub fn stopped_mode() -> bool {
+    matches!(
+        std::env::var("HAPPI_STOPPED").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }

@@ -133,18 +133,33 @@ pub async fn search_similar(
     }
     let rows = q.fetch_all(db).await?;
 
+    let query_dims = query_embedding.len();
+    let mut skipped_dim_mismatch = 0usize;
     let mut scored: Vec<SearchResult> = rows
         .into_iter()
-        .map(|(source_type, source_id, blob)| {
+        .filter_map(|(source_type, source_id, blob)| {
             let emb = bytes_to_f32s(&blob);
+            if emb.len() != query_dims {
+                skipped_dim_mismatch += 1;
+                return None;
+            }
             let score = cosine_similarity(query_embedding, &emb);
-            SearchResult {
+            Some(SearchResult {
                 source_type,
                 source_id,
                 score,
-            }
+            })
         })
         .collect();
+
+    if skipped_dim_mismatch > 0 {
+        tracing::warn!(
+            user_id,
+            query_dims,
+            skipped_dim_mismatch,
+            "skipping stored embeddings with mismatched dimensions"
+        );
+    }
 
     scored.sort_by(|a, b| {
         b.score

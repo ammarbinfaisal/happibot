@@ -5,13 +5,13 @@ services:
     env_file:
       - .env
     environment:
-      BIND_ADDR: 0.0.0.0:8080
+      BIND_ADDR: 0.0.0.0:8580
       DATABASE_URL: sqlite:///data/happi.db?mode=rwc
       # Set this in your env/shell for initData verification:
       # TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       RUST_LOG: info
     ports:
-      - "8580:8080"
+      - "8580:8580"
     volumes:
       - happi-data:/data
 

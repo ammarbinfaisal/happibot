@@ -33,7 +33,7 @@ Or standalone:
 
 ```sh
 docker build -t happi-backend ./backend
-docker run --rm -p 8580:8080 -e TELEGRAM_BOT_TOKEN=... happi-backend
+docker run --rm -p 8580:8580 -e TELEGRAM_BOT_TOKEN=... happi-backend
 ```
 
 The backend Docker build caches Cargo registry downloads and precompiled
@@ -59,18 +59,52 @@ and the webapp will send `x-user-id: 1` on API calls.
 
 Backend (`backend/.env.example`):
 
-- `BIND_ADDR` default `0.0.0.0:8080`
+- `BIND_ADDR` default `0.0.0.0:8580`
 - `DATABASE_URL` default `sqlite://./happi.db?mode=rwc`
 - `TELEGRAM_BOT_TOKEN` required to validate `x-telegram-init-data`
 - `CORS_ALLOW_ORIGIN` optional; if unset CORS is permissive for dev
 - `HOOK_URL` optional; if set backend will call Telegram `setWebhook` on startup
 - `WEBHOOK_SECRET_TOKEN` optional; if set required for `POST /telegram/webhook`
 - `MINIAPP_URL` optional; used for the bot’s `/start` Web App button
+- `HAPPI_STOPPED` optional; set to `1` to enable stopped mode (see below)
 
 Webapp (`webapp/.env.example`):
 
-- `NEXT_PUBLIC_API_BASE_URL` default `http://localhost:8080`
+- `NEXT_PUBLIC_API_BASE_URL` default `http://localhost:8580`
 - `NEXT_PUBLIC_DEV_USER_ID` optional dev fallback
+
+## Stopped mode
+
+When `HAPPI_STOPPED=1` is set, the bot stays online (webhook keeps responding
+`200 OK`) but every incoming message receives this reply instead of the normal
+pipeline:
+
+> @ammarbinfaisal stopped me. You can self-host if you need: https://github.com/ammarbinfaisal/happibot
+
+To enable stopped mode, add the variable to `backend/.env` and restart:
+
+```sh
+# backend/.env
+HAPPI_STOPPED=1
+```
+
+```sh
+docker compose up --build -d backend
+```
+
+To resume normal operation, remove or unset `HAPPI_STOPPED` and restart again.
+
+## Ikigai refresh
+
+Force-refresh all cached ikigai snapshots through the API:
+
+```sh
+cd backend
+./scripts/force-ikigai-all-users.sh
+```
+
+The script reads `user_id`s from the SQLite database and calls `POST /v1/ikigai/force`
+for each user using the backend's dev auth header.
 
 ## Docs
 
